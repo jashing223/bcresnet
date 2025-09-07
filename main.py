@@ -72,7 +72,7 @@ class Trainer:
         Trains the model and presents the train/test progress.
         """
 
-        wandb.init(entity="jashing223-national-taiwan-normal-university-org", project="pkws", name=f'baseline_sr_tau_{self.tau}_ver_{self.ver}')
+        wandb.init(entity="jashing223-national-taiwan-normal-university", project="pkws", name=f'baseline_sr_tau_{self.tau}_ver_{self.ver}')
 
         # train hyperparameters
         total_epoch = 200
