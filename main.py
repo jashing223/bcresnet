@@ -23,8 +23,11 @@ from matplotlib.font_manager import FontProperties
 import gradio as gr
 
 from bcresnet import BCResNets
+from speechbrain.pretrained import EncoderClassifier
 from utils import DownloadDataset, Padding, Preprocess, SpeechCommand, SplitDataset
+import warnings
 
+warnings.filterwarnings("ignore", category=UserWarning)
 
 class Trainer:
     def __init__(self):
@@ -72,7 +75,7 @@ class Trainer:
         Trains the model and presents the train/test progress.
         """
 
-        wandb.init(entity="jashing223-national-taiwan-normal-university", project="pkws", name=f'baseline_sr_tau_{self.tau}_ver_{self.ver}')
+        wandb.init(entity="jashing223-national-taiwan-normal-university", project="pkws", name=f'pkws_sr_tau_{self.tau}_ver_{self.ver}_deepFiLM')
 
         # train hyperparameters
         total_epoch = 200
@@ -143,15 +146,20 @@ class Trainer:
                 # print(f'keyword_class_labels: {keyword_class_labels.shape}, {keyword_class_labels}')
 
                 # Preprocess inputs
+                speaker_embeddings = self.preprocess_speaker_embedding_train(inputs, labels, augment=True)
                 inputs = self.preprocess_train(inputs, labels, augment=True)
                 # print(f'processed_inputs: {inputs.shape}')
 
                 # Get embeddings
                 embeddings = self.model.encode(inputs)
+                
                 # print(f'all_embeddings: {embeddings.shape}')
+
+                # condition with speaker embedding
+                inputs = self.model.FiLM(embeddings, speaker_embeddings)
                 
                 # Speech/non-speech classification
-                speech_outputs = self.model.speech_branch(embeddings)
+                speech_outputs = self.model.speech_branch(inputs)
                 # speech_outputs_prob = speech_outputs.softmax(dim=1)
                 # print(f'speech_outputs_prob: {speech_outputs_prob.shape}, {speech_outputs_prob}')
 
@@ -262,8 +270,9 @@ class Trainer:
             inputs = inputs.to(self.device)
             labels = labels.to(self.device)
             # print(f'labels: {labels}')
+            speaker_embeddings = self.preprocess_speaker_embedding_test(inputs, labels=labels, is_train=False, augment=augment)
             inputs = self.preprocess_test(inputs, labels=labels, is_train=False, augment=augment)
-            outputs = self.model.inference(inputs)  # already probabilities
+            outputs = self.model.inference(inputs, speaker_embeddings)  # already probabilities
             # print(f'outputs: {outputs}')
 
             # Collect all predictions and labels
@@ -359,13 +368,32 @@ class Trainer:
         frequency_masking_para = {1: 0, 1.5: 1, 2: 3, 3: 5, 6: 7, 8: 7}
 
         # Define preprocessors
+        self.speaker_embedder = EncoderClassifier.from_hparams(
+            source="speechbrain/spkrec-xvect-voxceleb",
+            run_opts={"device": self.device}
+        )
         self.preprocess_train = Preprocess(
             noise_dir,
             self.device,
+            self.speaker_embedder,
             specaug=specaugment,
             frequency_masking_para=frequency_masking_para[self.tau],
         )
-        self.preprocess_test = Preprocess(noise_dir, self.device)
+        self.preprocess_speaker_embedding_train = Preprocess(
+            noise_dir,
+            self.device,
+            self.speaker_embedder,
+            specaug=specaugment,
+            frequency_masking_para=frequency_masking_para[self.tau],
+            return_speaker_embedding = True
+        )
+        self.preprocess_test = Preprocess(noise_dir, self.device, self.speaker_embedder)
+        self.preprocess_speaker_embedding_test = Preprocess(
+            noise_dir,
+            self.device,
+            self.speaker_embedder,
+            return_speaker_embedding = True
+        )
 
     def _load_ckpt(self, ckpt_path, model):
         print(f'Loading model: {ckpt_path}')

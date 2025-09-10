@@ -34,7 +34,6 @@ sample_per_cls_v1 = [1854, 258, 257]
 sample_per_cls_v2 = [3077, 371, 408]
 SR = 16000
 
-
 def ScanAudioFiles(root_dir, ver):
     sample_per_cls = sample_per_cls_v1 if ver == 1 else sample_per_cls_v2
     audio_paths, labels = [], []
@@ -99,6 +98,7 @@ class Preprocess:
         self,
         noise_loc,
         device,
+        model,
         hop_length=160,
         win_length=480,
         n_fft=512,
@@ -109,6 +109,7 @@ class Preprocess:
         time_masking_para=20,
         frequency_mask_num=2,
         time_mask_num=2,
+        return_speaker_embedding = False
     ):
         if noise_loc is None:
             self.background_noise = []
@@ -117,17 +118,22 @@ class Preprocess:
                 torchaudio.load(file_name)[0] for file_name in glob(noise_loc + "/*.wav")
             ]
             assert len(self.background_noise) != 0
-        self.feature = LogMel(
-            device,
-            sample_rate=sample_rate,
-            hop_length=hop_length,
-            win_length=win_length,
-            n_fft=n_fft,
-            n_mels=n_mels,
-        )
+        
+        if not return_speaker_embedding:
+            self.feature = LogMel(
+                device,
+                sample_rate=sample_rate,
+                hop_length=hop_length,
+                win_length=win_length,
+                n_fft=n_fft,
+                n_mels=n_mels,
+            )
         self.sample_len = sample_rate
         self.specaug = specaug
         self.device = device
+        self.model = model
+        self.return_speaker_embedding = return_speaker_embedding
+
         if self.specaug:
             self.frequency_masking_para = frequency_masking_para
             self.time_masking_para = time_masking_para
@@ -140,6 +146,7 @@ class Preprocess:
 
     def __call__(self, x, labels=None, augment=True, noise_prob=0.8, is_train=True):
         assert len(x.shape) == 3
+        x_original = x.clone() if self.return_speaker_embedding else None
         if augment:
             for idx in range(x.shape[0]):
                 if labels[idx] != 0 and (not is_train or random.random() > noise_prob):
@@ -162,6 +169,24 @@ class Preprocess:
                 else:  # valid
                     x[idx] = x[idx] + noise
                 x[idx] = torch.clamp(x[idx], -1.0, 1.0)
+
+        # Return embeddings or log-mel features
+        if self.return_speaker_embedding:
+            # x shape: (B, 1, T) or (B, T)，要確保維度正確
+            if x.dim() == 3 and x.shape[1] == 1:
+                x = x.squeeze(1)  # → (B, T)
+
+            with torch.no_grad():
+                # SpeechBrain 的 encode_batch 支援 batch 輸入
+                embeddings = self.model.encode_batch(x)  # (B, 1, 512)
+
+            embeddings = embeddings.squeeze(1)  # → (B, 512)
+
+            # 如果你想要小一點的維度，可以在 __init__ 加上 projection layer
+            # 例如: self.proj = nn.Linear(512, 128)
+            # 然後這裡就 embeddings = self.proj(embeddings)
+
+            return embeddings.to(self.device)
 
         x = self.feature(x)
         if self.specaug:
@@ -311,3 +336,12 @@ def SplitDataset(loc):
             "%s/%s" % (target_loc, split_name), "%s/%s_12class" % (loc, split_name)
         )
         make_empty_audio("%s/%s_12class/_silence_" % (loc, split_name), sample_per_cls[idx])
+
+def preprocess_speaker_embedding(inputs):
+    embeddings = []
+    with torch.no_grad():
+        for noisy_features in inputs:
+            embeddings.append(speaker_embedder(noisy_features))
+    tensor_embeddings = [torch.from_numpy(emb) for emb in embeddings]
+    batched_embeddings = torch.stack(tensor_embeddings, dim=0)
+    return batched_embeddings

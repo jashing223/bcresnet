@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from subspectralnorm import SubSpectralNorm
+from utils import Preprocess
 
 
 class ConvBNReLU(nn.Module):
@@ -197,6 +198,12 @@ class BCResNets(nn.Module):
             nn.Conv2d(self.c[-1], self.num_classes-2, 1),
         )
 
+        self.projection = nn.Sequential(
+            nn.Linear(512, 256),
+            nn.Linear(256, 128),
+            nn.Linear(128, 2 * self.c[-2])
+        )
+
     def encode(self, x):
         x = self.cnn_head(x)
         for i, num_modules in enumerate(self.n):
@@ -204,6 +211,15 @@ class BCResNets(nn.Module):
                 x = self.BCBlocks[i][j](x)
 
         return x
+    
+    def FiLM(self, logits, speaker_embeddings):
+        gamma_beta = self.projection(speaker_embeddings)
+        r, b = gamma_beta.chunk(2, dim=-1)
+
+        r = r.unsqueeze(-1).unsqueeze(-1)
+        b = b.unsqueeze(-1).unsqueeze(-1)
+
+        return r * logits + b
     
     def speech_branch(self, x):
         x = self.classifier1(x)
@@ -223,14 +239,17 @@ class BCResNets(nn.Module):
 
         return x
 
-    def inference(self, x, speech_threshold=0.5, keyword_threshold=0.5):  # batch = 1
+    def inference(self, x, speaker_embeddings, speech_threshold=0.5, keyword_threshold=0.5):  # batch = 1
         with torch.no_grad():
             # Define probabilities
             P_non_speech = P_non_keyword = torch.zeros(1, 1, device=x.device)
             P_keyword_id = torch.zeros(1, 10, device=x.device)
 
-            # Extract embeddings
+            # Extract encoder logits
             x = self.encode(x)
+
+            # affine transformation
+            x = self.FiLM(x, speaker_embeddings)
 
             # Step 1: Speech vs. Non-speech classification
             P_speech = torch.sigmoid(self.speech_branch(x))  # [batch, 1] -> P(speech)
