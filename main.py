@@ -75,10 +75,11 @@ class Trainer:
         Trains the model and presents the train/test progress.
         """
 
-        wandb.init(entity="jashing223-national-taiwan-normal-university", project="pkws", name=f'pkws_sr_tau_{self.tau}_ver_{self.ver}_deepFiLM')
+        # wandb.init(entity="jashing223-national-taiwan-normal-university", project="pkws", name=f'pkws_sr_tau_{self.tau}_ver_{self.ver}_MLPFiLM')
+        wandb.init(entity="jashing223-national-taiwan-normal-university", project="pkws", name=f'pkws_resFiLM')
 
         # train hyperparameters
-        total_epoch = 200
+        total_epoch = 100
         warmup_epoch = 5
         init_lr = 1e-1
         lr_lower_limit = 0
@@ -86,7 +87,8 @@ class Trainer:
         # optimizer
         optimizer = torch.optim.SGD([
             {'params': list(self.model.cnn_head.parameters()) + list(self.model.BCBlocks.parameters()), 'weight_decay': 1e-3, 'momentum': 0.9},
-            {'params': self.model.classifier1.parameters(), 'weight_decay': 1e-3, 'momentum': 0.9},
+            {'params': self.model.projection.parameters(), 'weight_decay': 1e-3, 'momentum': 0.9},
+            {'params': self.model.classifier1.parameters(), 'weight_decay': 1e-5, 'momentum': 0.8},
             {'params': self.model.classifier2.parameters(), 'weight_decay': 1e-3, 'momentum': 0.9},
             {'params': self.model.classifier3.parameters(), 'weight_decay': 1e-3, 'momentum': 0.9}
         ], lr=0)
@@ -322,9 +324,9 @@ class Trainer:
         """
 
         print("Check google speech commands dataset v1 or v2 ...")
-        if not os.path.isdir("/share/nas169/jethrowang/DB/GSC"):
-            os.mkdir("/share/nas169/jethrowang/DB/GSC")
-        base_dir = "/share/nas169/jethrowang/DB/GSC/speech_commands_v0.01"
+        if not os.path.isdir("/home/jashing223/datasets/GSC"):
+            os.mkdir("/home/jashing223/datasets/GSC")
+        base_dir = "/home/jashing223/datasets/GSC/speech_commands_v0.01"
         url = "https://storage.googleapis.com/download.tensorflow.org/data/speech_commands_v0.01.tar.gz"
         url_test = "https://storage.googleapis.com/download.tensorflow.org/data/speech_commands_test_set_v0.01.tar.gz"
         if self.ver == 2:

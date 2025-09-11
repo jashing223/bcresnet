@@ -199,9 +199,10 @@ class BCResNets(nn.Module):
         )
 
         self.projection = nn.Sequential(
-            nn.Linear(512, 256),
-            nn.Linear(256, 128),
-            nn.Linear(128, 2 * self.c[-2])
+            nn.LayerNorm(512),
+            nn.Linear(512, 64),
+            nn.ReLU(),
+            nn.Linear(64, self.c[-2] * 2)
         )
 
     def encode(self, x):
@@ -219,7 +220,7 @@ class BCResNets(nn.Module):
         r = r.unsqueeze(-1).unsqueeze(-1)
         b = b.unsqueeze(-1).unsqueeze(-1)
 
-        return r * logits + b
+        return logits * (1 + torch.sigmoid(r)) + b
     
     def speech_branch(self, x):
         x = self.classifier1(x)
