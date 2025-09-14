@@ -52,6 +52,7 @@ class Trainer:
         parser.add_argument("--plot", help="Only run umap plot", action="store_true")
         parser.add_argument("--demo", help="Only run demo", action="store_true")
         parser.add_argument("--ckpt", help="Path to checkpoint file for evaluation", type=str, default="")
+        parser.add_argument("--resume", help="Path to checkpoint file for resumming the training", type=str, default="")
         args = parser.parse_args()
         self.__dict__.update(vars(args))
         self.device = torch.device("cuda:%d" % self.gpu if torch.cuda.is_available() else "cpu")
@@ -88,7 +89,7 @@ class Trainer:
         lr_lower_limit = 0
 
         # optimizer
-        optimizer = torch.optim.SGD([
+        optimizer = self.optimizer if self.optimizer else torch.optim.SGD([
             {'params': list(self.model.cnn_head.parameters()) + list(self.model.BCBlocks.parameters()), 'weight_decay': 1e-3, 'momentum': 0.9},
             {'params': self.model.projection.parameters(), 'weight_decay': 1e-3, 'momentum': 0.9},
             {'params': self.model.classifier1.parameters(), 'weight_decay': 1e-3, 'momentum': 0.9},
@@ -99,13 +100,14 @@ class Trainer:
         
         n_step_warmup = len(self.train_loader) * warmup_epoch
         total_iter = len(self.train_loader) * total_epoch
-        iterations = 0
+        iterations = len(self.train_loader) * self.epoch
+        loss = self.loss if self.loss else torch.tensor(0.0, device=self.device)
 
         # Best model tracking
         best_valid_fa = 0
 
         # train
-        for epoch in range(total_epoch):
+        for epoch in range(self.epoch, total_epoch+1):
             self.model.train()
             for sample in tqdm(self.train_loader, desc="epoch %d, iters" % (epoch + 1)):
                 # lr cos schedule
@@ -209,7 +211,7 @@ class Trainer:
 
                 # Calculate total loss
                 loss = softmax_loss + self.lambda1 * keyword_loss + self.lambda2 * speech_loss
-                wandb.log({"Total Loss": loss.item(), "Softmax Loss": softmax_loss.item(), "Keyword Loss": keyword_loss.item(), "Speech Loss": speech_loss.item(), "LR": lr})
+                # wandb.log({"Total Loss": loss.item(), "Softmax Loss": softmax_loss.item(), "Keyword Loss": keyword_loss.item(), "Speech Loss": speech_loss.item(), "LR": lr})
 
                 # Backpropagation and weight update
                 optimizer.zero_grad()
@@ -242,7 +244,7 @@ class Trainer:
         # After training, test the best checkpoint
         # self._test_best_checkpoint()
 
-        wandb.finish()
+        # wandb.finish()
 
         print("End.")
 
@@ -459,19 +461,16 @@ class Trainer:
 
         if self.eval or self.plot or self.demo:
             self.model = self._load_ckpt(self.ckpt, self.model)
+        
+        self.epoch, self.optimizer, self.loss = 0, None, None
 
-    def _save_model(self, epoch, valid_acc, valid_fa):
-        checkpoint = {
-            'epoch': epoch + 1,
-            'model_state_dict': self.model.state_dict(),
-            'valid_acc': valid_acc,
-            'valid_fa': valid_fa
-        }
-            
-        checkpoint_path = os.path.join(self.checkpoint_dir, f'model_epoch_{epoch+1}_acc_{valid_acc:.2f}_fa_{valid_fa:.2f}.ckpt')
-        torch.save(checkpoint, checkpoint_path)
+        if self.resume:
+            checkpoint = torch.load(self.resume, weights_only=False)
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+            self.epoch = checkpoint['epoch']
+            self.optimizer = checkpoint['optimizer']
 
-    def _save_top_3_checkpoints(self, epoch, valid_fa):
+    def _save_top_3_checkpoints(self, epoch, optimizer ,loss , valid_fa):
         """
         Save checkpoints for top 3 validation FAs.
         
@@ -484,6 +483,8 @@ class Trainer:
         checkpoint = {
             'epoch': epoch + 1,
             'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'loss': loss,
             'valid_fa': valid_fa
         }
 
