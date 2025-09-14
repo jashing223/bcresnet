@@ -6,7 +6,6 @@ import torch.nn.functional as F
 from torch import nn
 
 from subspectralnorm import SubSpectralNorm
-from utils import Preprocess
 
 
 class ConvBNReLU(nn.Module):
@@ -220,7 +219,7 @@ class BCResNets(nn.Module):
         r = r.unsqueeze(-1).unsqueeze(-1)
         b = b.unsqueeze(-1).unsqueeze(-1)
 
-        return logits * (1 + torch.sigmoid(r)) + b
+        return logits * (1 + r) + b
     
     def speech_branch(self, x):
         x = self.classifier1(x)

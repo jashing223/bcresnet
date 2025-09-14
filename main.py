@@ -12,7 +12,8 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvision import transforms
 from tqdm import tqdm
-from sklearn.metrics import roc_auc_score, f1_score, confusion_matrix
+from sklearn.metrics import roc_auc_score, f1_score, confusion_matrix, roc_curve
+from sklearn.preprocessing import label_binarize
 import wandb
 from thop import profile
 import json
@@ -21,6 +22,8 @@ import umap
 import matplotlib.pyplot as plt
 from matplotlib.font_manager import FontProperties
 import gradio as gr
+from scipy.optimize import brentq
+from scipy.interpolate import interp1d
 
 from bcresnet import BCResNets
 from speechbrain.pretrained import EncoderClassifier
@@ -59,7 +62,7 @@ class Trainer:
         font_prop = FontProperties(fname=font_path, size=17)
 
         # Add a list to track top 3 validation accuracies
-        self.top_3_valid_accs = []
+        self.top_3_valid_fas = []
         
         # Create a directory to save checkpoints if it doesn't exist
         self.checkpoint_dir = f"./checkpoints/sr_tau_{self.tau}_ver_{self.ver}"
@@ -76,7 +79,7 @@ class Trainer:
         """
 
         # wandb.init(entity="jashing223-national-taiwan-normal-university", project="pkws", name=f'pkws_sr_tau_{self.tau}_ver_{self.ver}_MLPFiLM')
-        wandb.init(entity="jashing223-national-taiwan-normal-university", project="pkws", name=f'pkws_resFiLM')
+        wandb.init(entity="jashing223-national-taiwan-normal-university", project="pkws", name=f'pkws_FiLM_bottle_neck_residual')
 
         # train hyperparameters
         total_epoch = 100
@@ -88,17 +91,18 @@ class Trainer:
         optimizer = torch.optim.SGD([
             {'params': list(self.model.cnn_head.parameters()) + list(self.model.BCBlocks.parameters()), 'weight_decay': 1e-3, 'momentum': 0.9},
             {'params': self.model.projection.parameters(), 'weight_decay': 1e-3, 'momentum': 0.9},
-            {'params': self.model.classifier1.parameters(), 'weight_decay': 1e-5, 'momentum': 0.8},
+            {'params': self.model.classifier1.parameters(), 'weight_decay': 1e-3, 'momentum': 0.9},
             {'params': self.model.classifier2.parameters(), 'weight_decay': 1e-3, 'momentum': 0.9},
             {'params': self.model.classifier3.parameters(), 'weight_decay': 1e-3, 'momentum': 0.9}
         ], lr=0)
+        print("projection params:", sum(p.numel() for p in self.model.projection.parameters()))
         
         n_step_warmup = len(self.train_loader) * warmup_epoch
         total_iter = len(self.train_loader) * total_epoch
         iterations = 0
 
         # Best model tracking
-        best_valid_acc = 0
+        best_valid_fa = 0
 
         # train
         for epoch in range(total_epoch):
@@ -217,28 +221,66 @@ class Trainer:
             # wandb.log({"LR": lr})
             with torch.no_grad():
                 self.model.eval()
-                valid_acc, valid_auroc, valid_f1, valid_fa = self.Test(self.valid_dataset, self.valid_loader, augment=True)
-                print(f"Valid - Acc: {valid_acc:.3f}, AUROC: {valid_auroc:.3f}, F1: {valid_f1:.3f}, FA: {valid_fa:.3f}")
+                valid_acc, valid_auroc, valid_f1, valid_fa, valid_eer = self.Test(self.valid_dataset, self.valid_loader, augment=True)
+                print(f"Valid - Acc: {valid_acc:.3f}, AUROC: {valid_auroc:.3f}, F1: {valid_f1:.3f}, FA: {valid_fa:.3f}, EER: {valid_eer:.3f}")
                 wandb.log({
                     "Epoch": epoch + 1,
                     "Valid_Acc": valid_acc,
                     "Valid_AUROC": valid_auroc,
                     "Valid_F1": valid_f1,
-                    "Valid_FA": valid_fa
+                    "Valid_FA": valid_fa,
+                    "Valid_EER": valid_eer
                 })
 
                 # Save checkpoint for top 3 validation accuracies
-                self._save_top_3_checkpoints(epoch, valid_acc)
+                if epoch > 80: self._save_model(epoch, valid_acc, valid_fa)
 
-        test_acc, test_auroc, test_f1, test_fa = self.Test(self.test_dataset, self.test_loader, augment=False)  # official testset
-        print(f"Last ckpt test - Acc: {test_acc:.3f}, AUROC: {test_auroc:.3f}, F1: {test_f1:.3f}, FA: {test_fa:.3f}")
+
+        test_acc, test_auroc, test_f1, test_fa, test_eer = self.Test(self.test_dataset, self.test_loader, augment=False)  # official testset
+        print(f"Last ckpt test - Acc: {test_acc:.3f}, AUROC: {test_auroc:.3f}, F1: {test_f1:.3f}, FA: {test_fa:.3f}, EER: {test_eer:.3f}")
 
         # After training, test the best checkpoint
-        self._test_best_checkpoint()
+        # self._test_best_checkpoint()
 
         wandb.finish()
 
         print("End.")
+
+    def _binary_eer(self,y_true, y_score):
+        """計算 binary 的 EER"""
+        fpr, tpr, _ = roc_curve(y_true, y_score, pos_label=1)
+        return brentq(lambda x: 1. - x - interp1d(fpr, tpr)(x), 0., 1.)
+
+    def eer_score(self,y_true, y_score):
+        """
+        計算 Equal Error Rate (EER, %) for binary or multi-class (OVR only).
+        
+        參數:
+        - y_true: 一維 array-like, 標籤
+        - y_score: binary -> 一維預測分數
+                multi-class -> shape (n_samples, n_classes)，每類的分數
+
+        回傳:
+        - eer (百分比, float 或 list)
+        """
+        y_true = np.array(y_true)
+        y_score = np.array(y_score)
+
+        # Binary
+        if y_score.ndim == 1 or y_score.shape[1] == 1:
+            return self._binary_eer(y_true, y_score.ravel()) * 100.0
+
+        # Multi-class OVR
+        classes = np.unique(y_true)
+        y_true_bin = label_binarize(y_true, classes=classes)
+
+        eer_list = []
+        for i in range(len(classes)):
+            eer = self._binary_eer(y_true_bin[:, i], y_score[:, i])
+            eer_list.append(eer * 100.0)
+
+        return np.mean(eer_list)
+
 
     def Test(self, dataset, loader, augment):
         """
@@ -304,6 +346,8 @@ class Trainer:
         
         # F1-score calculation
         f1 = f1_score(np.array(all_labels), np.array(all_predictions), average='macro') * 100.0
+
+        eer = self.eer_score(all_labels, all_outputs)
         
         # False alarm rate calculation
         for i in [0, 1]:  # Only consider label 0 (_silence_) and label 1 (_unknown_)
@@ -314,7 +358,7 @@ class Trainer:
         else:
             fa = fa_count / neg_total * 100.0
 
-        return acc, auroc, f1, fa
+        return acc, auroc, f1, fa, eer
 
     def _load_data(self):
         """
@@ -399,7 +443,7 @@ class Trainer:
 
     def _load_ckpt(self, ckpt_path, model):
         print(f'Loading model: {ckpt_path}')
-        ckpt = torch.load(ckpt_path)
+        ckpt = torch.load(ckpt_path, weights_only=False)
         model.load_state_dict(ckpt['model_state_dict'])
         model.eval()
 
@@ -416,48 +460,65 @@ class Trainer:
         if self.eval or self.plot or self.demo:
             self.model = self._load_ckpt(self.ckpt, self.model)
 
-    def _save_top_3_checkpoints(self, epoch, valid_acc):
+    def _save_model(self, epoch, valid_acc, valid_fa):
+        checkpoint = {
+            'epoch': epoch + 1,
+            'model_state_dict': self.model.state_dict(),
+            'valid_acc': valid_acc,
+            'valid_fa': valid_fa
+        }
+            
+        checkpoint_path = os.path.join(self.checkpoint_dir, f'model_epoch_{epoch+1}_acc_{valid_acc:.2f}_fa_{valid_fa:.2f}.ckpt')
+        torch.save(checkpoint, checkpoint_path)
+
+    def _save_top_3_checkpoints(self, epoch, valid_fa):
         """
-        Save checkpoints for top 3 validation accuracies.
+        Save checkpoints for top 3 validation FAs.
         
         Parameters:
             epoch (int): Current training epoch
-            valid_acc (float): Validation accuracy for the current epoch
+            valid_fa (float): Validation Fa for the current epoch
         """
 
         # Prepare checkpoint dictionary
         checkpoint = {
             'epoch': epoch + 1,
             'model_state_dict': self.model.state_dict(),
-            'valid_acc': valid_acc
+            'valid_fa': valid_fa
         }
 
         # If less than 3 best accuracies, always save
-        if len(self.top_3_valid_accs) < 3:
-            checkpoint_path = os.path.join(self.checkpoint_dir, f'model_epoch_{epoch+1}_acc_{valid_acc:.2f}.ckpt')
+        if len(self.top_3_valid_fas) < 3:
+            checkpoint_path = os.path.join(self.checkpoint_dir, f'model_epoch_{epoch+1}_fa_{valid_fa:.2f}.ckpt')
             torch.save(checkpoint, checkpoint_path)
-            self.top_3_valid_accs.append((valid_acc, checkpoint_path))
-            self.top_3_valid_accs.sort(reverse=True)  # Sort in descending order
+            self.top_3_valid_fas.append((valid_fa, checkpoint_path))
+            self.top_3_valid_fas.sort()  # Sort in descending order
         else:
             # Check if current accuracy is better than the worst in top 3
-            if valid_acc > self.top_3_valid_accs[-1][0]:
+            if valid_fa < self.top_3_valid_fas[-1][0]:
                 # Remove the worst checkpoint
-                _, worst_path = self.top_3_valid_accs.pop()
+                _, worst_path = self.top_3_valid_fas.pop()
                 os.remove(worst_path)
 
                 # Save new checkpoint
-                checkpoint_path = os.path.join(self.checkpoint_dir, f'model_epoch_{epoch+1}_acc_{valid_acc:.2f}.ckpt')
+                checkpoint_path = os.path.join(self.checkpoint_dir, f'model_epoch_{epoch+1}_fa_{valid_fa:.2f}.ckpt')
                 torch.save(checkpoint, checkpoint_path)
-                self.top_3_valid_accs.append((valid_acc, checkpoint_path))
-                self.top_3_valid_accs.sort(reverse=True)  # Sort in descending order
+                self.top_3_valid_fas.append((valid_fa, checkpoint_path))
+                self.top_3_valid_fas.sort()  # Sort in descending order
 
         # Log the current top 3 checkpoint paths
-        print("Current top 3 validation accuracy checkpoints:")
-        for acc, path in self.top_3_valid_accs:
-            print(f"Acc: {acc:.3f}, Path: {path}")
+        print("Current top 3 validation FA checkpoints:")
+        for fa, path in self.top_3_valid_fas:
+            print(f"FA: {fa:.3f}, Path: {path}")
     
     def _calculate_params(self, model):
         # Calculate number of parameters
+        # optimizer
+        # print("cnn_head + BCBlocks params:", sum(p.numel() for p in list(self.model.cnn_head.parameters()) + list(self.model.BCBlocks.parameters())))
+        # print("projection params:", sum(p.numel() for p in self.model.projection.parameters()))
+        # print("classifier1 params:", sum(p.numel() for p in self.model.classifier1.parameters()))
+        # print("classifier2 params:", sum(p.numel() for p in self.model.classifier2.parameters()))
+        # print("classifier3 params:", sum(p.numel() for p in self.model.classifier3.parameters()))
         total_params = sum(p.numel() for p in model.parameters())
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
@@ -474,21 +535,21 @@ class Trainer:
         """
         Load and test the best checkpoint from the top 3 validation accuracies.
         """
-        if not self.top_3_valid_accs:
+        if not self.top_3_valid_fas:
             print("No checkpoints were saved. Skipping best checkpoint test.")
             return
 
-        # Sort checkpoints by validation accuracy in descending order
-        sorted_checkpoints = sorted(self.top_3_valid_accs, reverse=True)
+        # Sort checkpoints by validation FA in descending order
+        sorted_checkpoints = sorted(self.top_3_valid_fas)
         
         # Select the best checkpoint
-        best_valid_acc, best_checkpoint_path = sorted_checkpoints[0]
+        best_valid_fa, best_checkpoint_path = sorted_checkpoints[0]
         
-        print(f"\nTesting best checkpoint with validation accuracy: {best_valid_acc:.3f}")
+        print(f"\nTesting best checkpoint with validation FA: {best_valid_fa:.3f}")
         print(f"Checkpoint path: {best_checkpoint_path}")
 
         # Load the best checkpoint
-        checkpoint = torch.load(best_checkpoint_path)
+        checkpoint = torch.load(best_checkpoint_path, weights_only=False)
         
         # Create a new model instance and load the state dict
         best_model = BCResNets(int(self.tau * 8)).to(self.device)
@@ -503,7 +564,7 @@ class Trainer:
 
         # Run test on the loaded model
         with torch.no_grad():
-            best_test_acc, best_test_auroc, best_test_f1, best_test_fa = self.Test(self.test_dataset, self.test_loader, augment=False)
+            best_test_acc, best_test_auroc, best_test_f1, best_test_fa, best_test_eer = self.Test(self.test_dataset, self.test_loader, augment=False)
             print(f"Best ckpt test - Acc: {best_test_acc:.3f}, AUROC: {best_test_auroc:.3f}, F1: {best_test_f1:.3f}, FA: {best_test_fa:.3f}")
         
         # Calculate number of parameters
@@ -518,6 +579,7 @@ class Trainer:
             'auroc': best_test_auroc,
             'f1-score': best_test_f1,
             'false_alarm': best_test_fa,
+            'EER': best_test_eer,
             'params': {
                 'total_params_k': total_params/1000,
                 'trainable_params_k': trainable_params/1000
@@ -538,16 +600,17 @@ class Trainer:
         total_params, trainable_params = self._calculate_params(self.model)
 
         # Calculate MACs (Multiply-Accumulate Operations)
-        macs = self._calculate_macs(self.model)
+        # macs = self._calculate_macs(self.model)
 
         # Perform evaluation
         with torch.no_grad():
-            eval_acc, eval_auroc, eval_f1, eval_fa = self.Test(self.test_dataset, self.test_loader, augment=False)
+            eval_acc, eval_auroc, eval_f1, eval_fa, eval_eer = self.Test(self.test_dataset, self.test_loader, augment=False)
             
         # Print results
         print(f"Eval - Acc: {eval_acc:.3f}, AUROC: {eval_auroc:.3f}, F1: {eval_f1:.3f}, FA: {eval_fa:.3f}")
         print(f"Params - Total: {total_params/1000:.2f}k, Trainable: {trainable_params/1000:.2f}k")
-        print(f"MACs: {macs/1e6:.2f}M")
+        print()
+        # print(f"MACs: {macs/1e6:.2f}M")
 
         # Prepare results dictionary
         results = {
@@ -555,11 +618,12 @@ class Trainer:
             'auroc': eval_auroc,
             'f1-score': eval_f1,
             'false_alarm': eval_fa,
+            'EER': eval_eer,
             'params': {
                 'total_params_k': total_params/1000,
                 'trainable_params_k': trainable_params/1000
             },
-            'macs_m': macs/1e6
+            # 'macs_m': macs/1e6
         }
 
         # Save results to JSON in the same directory as the checkpoint
