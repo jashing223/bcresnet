@@ -80,7 +80,7 @@ class Trainer:
         """
 
         # wandb.init(entity="jashing223-national-taiwan-normal-university", project="pkws", name=f'pkws_sr_tau_{self.tau}_ver_{self.ver}_MLPFiLM')
-        wandb.init(entity="jashing223-national-taiwan-normal-university", project="pkws", name=f'pkws_FiLM_bottle_neck_residual')
+        wandb.init(entity="jashing223-national-taiwan-normal-university", project="pkws", name=f'pkws_FiLM_residual')
 
         # train hyperparameters
         total_epoch = 100
@@ -211,7 +211,7 @@ class Trainer:
 
                 # Calculate total loss
                 loss = softmax_loss + self.lambda1 * keyword_loss + self.lambda2 * speech_loss
-                # wandb.log({"Total Loss": loss.item(), "Softmax Loss": softmax_loss.item(), "Keyword Loss": keyword_loss.item(), "Speech Loss": speech_loss.item(), "LR": lr})
+                wandb.log({"Total Loss": loss.item(), "Softmax Loss": softmax_loss.item(), "Keyword Loss": keyword_loss.item(), "Speech Loss": speech_loss.item(), "LR": lr})
 
                 # Backpropagation and weight update
                 optimizer.zero_grad()
@@ -470,6 +470,17 @@ class Trainer:
             self.epoch = checkpoint['epoch']
             self.optimizer = checkpoint['optimizer']
 
+    def _save_model(self, epoch, valid_acc, valid_fa):
+        checkpoint = {
+            'epoch': epoch + 1,
+            'model_state_dict': self.model.state_dict(),
+            'valid_acc': valid_acc,
+            'valid_fa': valid_fa
+        }
+            
+        checkpoint_path = os.path.join(self.checkpoint_dir, f'model_epoch_{epoch+1}_acc_{valid_acc:.2f}_fa_{valid_fa:.2f}.ckpt')
+        torch.save(checkpoint, checkpoint_path)
+
     def _save_top_3_checkpoints(self, epoch, optimizer ,loss , valid_fa):
         """
         Save checkpoints for top 3 validation FAs.
@@ -608,7 +619,7 @@ class Trainer:
             eval_acc, eval_auroc, eval_f1, eval_fa, eval_eer = self.Test(self.test_dataset, self.test_loader, augment=False)
             
         # Print results
-        print(f"Eval - Acc: {eval_acc:.3f}, AUROC: {eval_auroc:.3f}, F1: {eval_f1:.3f}, FA: {eval_fa:.3f}")
+        print(f"Eval - Acc: {eval_acc:.3f}, AUROC: {eval_auroc:.3f}, F1: {eval_f1:.3f}, FA: {eval_fa:.3f}, EER: {eval_eer:.3f}")
         print(f"Params - Total: {total_params/1000:.2f}k, Trainable: {trainable_params/1000:.2f}k")
         print()
         # print(f"MACs: {macs/1e6:.2f}M")

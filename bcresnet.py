@@ -200,8 +200,8 @@ class BCResNets(nn.Module):
         self.projection = nn.Sequential(
             nn.LayerNorm(512),
             nn.Linear(512, 64),
-            nn.ReLU(),
-            nn.Linear(64, self.c[-2] * 2)
+            nn.Linear(64, self.c[-2] * 2),
+            nn.ReLU()
         )
 
     def encode(self, x):
