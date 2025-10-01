@@ -1,0 +1,12 @@
+gradio
+matplotlib
+numpy
+Requests
+scikit_learn
+thop
+torch
+torchaudio
+torchvision
+tqdm
+umap
+wandb
