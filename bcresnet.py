@@ -8,6 +8,49 @@ from torch import nn
 from subspectralnorm import SubSpectralNorm
 
 
+class FiLMLayer(nn.Module):
+    """Feature-wise Linear Modulation layer.
+    
+    Takes speaker embedding as input and generates gamma and beta
+    for modulating the encoded features.
+    """
+    def __init__(self, embedding_dim=512, feature_dim=20, hidden_dim=256):
+        super().__init__()
+        self.embedding_dim = embedding_dim
+        self.feature_dim = feature_dim
+        
+        # Network to generate gamma and beta from speaker embedding
+        self.film_generator = nn.Sequential(
+            nn.Linear(embedding_dim, hidden_dim),
+            nn.ReLU(True),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(True),
+            nn.Linear(hidden_dim, feature_dim * 2)  # Generate both gamma and beta
+        )
+        
+    def forward(self, features, embedding):
+        """
+        Args:
+            features: Encoded audio features [batch, channels, height, width]
+            embedding: Speaker embedding [batch, embedding_dim]
+        
+        Returns:
+            Modulated features [batch, channels, height, width]
+        """
+        batch_size = features.shape[0]
+        channels = features.shape[1]
+        
+        # Generate gamma and beta
+        film_params = self.film_generator(embedding)  # [batch, channels * 2]
+        gamma = film_params[:, :channels].view(batch_size, channels, 1, 1)
+        beta = film_params[:, channels:].view(batch_size, channels, 1, 1)
+        
+        # Apply FiLM modulation
+        modulated = gamma * features + beta
+        
+        return modulated
+
+
 class ConvBNReLU(nn.Module):
     def __init__(
         self,
@@ -133,9 +176,10 @@ def BCBlockStage(num_layers, last_channel, cur_channel, idx, use_stride):
 
 
 class BCResNets(nn.Module):
-    def __init__(self, base_c, num_classes=12):
+    def __init__(self, base_c, num_classes=12, embedding_dim=512):
         super().__init__()
         self.num_classes = num_classes
+        self.embedding_dim = embedding_dim
         self.n = [2, 2, 4, 4]  # identical modules repeated n times
         self.c = [
             base_c * 2,  # 1 * 8 * 2 = 16
@@ -161,7 +205,10 @@ class BCResNets(nn.Module):
             use_stride = idx in self.s
             self.BCBlocks.append(BCBlockStage(n, self.c[idx], self.c[idx + 1], idx, use_stride))
 
-        # Speech branch
+        # FiLM layer for speaker conditioning
+        self.film_layer = FiLMLayer(embedding_dim=self.embedding_dim, feature_dim=self.c[-2])
+
+        # Speech branch (now acts as speaker classifier with 3 classes)
         self.classifier1 = nn.Sequential(
             nn.Conv2d(
                 self.c[-2], self.c[-2], (5, 5), bias=False, groups=self.c[-2], padding=(0, 2)
@@ -170,7 +217,7 @@ class BCResNets(nn.Module):
             nn.BatchNorm2d(self.c[-1]),
             nn.ReLU(True),
             nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Conv2d(self.c[-1], 1, 1),
+            nn.Conv2d(self.c[-1], 3, 1),  # 3 classes: same speaker, different speaker, silence
         )
 
         # Keyword branch
@@ -205,10 +252,20 @@ class BCResNets(nn.Module):
 
         return x
     
-    def speech_branch(self, x):
+    def speech_branch(self, x, speaker_embedding=None):
+        """Speaker classification branch with FiLM conditioning.
+        
+        Args:
+            x: Encoded features
+            speaker_embedding: Speaker embedding for FiLM modulation
+        
+        Returns:
+            Speaker classification logits (3 classes)
+        """
+        if speaker_embedding is not None:
+            x = self.film_layer(x, speaker_embedding)
         x = self.classifier1(x)
         x = x.view(-1, x.shape[1])
-
         return x
     
     def keyword_branch(self, x):
@@ -222,37 +279,58 @@ class BCResNets(nn.Module):
         x = x.view(-1, x.shape[1])
 
         return x
+    
+    def forward(self, x, speaker_embedding):
+        """Forward pass with optional speaker embedding.
+        
+        Args:
+            x: Input audio features
+            speaker_embedding: Optional speaker embedding for FiLM
+        
+        Returns:
+            Tuple of (speaker_logits, keyword_logits, keyword_class_logits)
+        """
+        # Encode audio features
+        encoded = self.encode(x)
+        
+        # Speaker branch with FiLM conditioning
+        speaker_logits = self.speech_branch(encoded, speaker_embedding)
+        
+        # Keyword branches without conditioning
+        keyword_logits = self.keyword_branch(encoded)
+        keyword_class_logits = self.keyword_classification(encoded)
+        
+        return speaker_logits, keyword_logits, keyword_class_logits
 
-    def inference(self, x, speech_threshold=0.5, keyword_threshold=0.5):  # batch = 1
+    def inference(self, x, speaker_embedding, speech_threshold=0.1, keyword_threshold=0.5):  # batch = 1
         with torch.no_grad():
             # Define probabilities
             P_non_speech = P_non_keyword = torch.zeros(1, 1, device=x.device)
             P_keyword_id = torch.zeros(1, 10, device=x.device)
 
             # Extract embeddings
-            x = self.encode(x)
+            encoded = self.encode(x)
 
-            # Step 1: Speech vs. Non-speech classification
-            P_speech = torch.sigmoid(self.speech_branch(x))  # [batch, 1] -> P(speech)
-            # print(f'P_speech: {P_speech}')
+            # Get speaker classification (now includes speaker verification)
+            # Note: We still use this for speech detection logic
+            speaker_logits = self.speech_branch(encoded, speaker_embedding)
+            speaker_probs = F.softmax(speaker_logits, dim=1)
+            # only take target speaker speech
+            P_speech = speaker_probs[:, 0] 
+            
             if P_speech.squeeze(0) < speech_threshold:  # if non-speech
                 P_non_speech = torch.ones(1, 1, device=x.device)
-                P = torch.cat([P_non_speech, P_non_keyword, P_keyword_id], dim=1)  # [batch, 12]: 1.0, 0.0, 0.0, ..., 0.0
-                # print("Total probability 1:", P.sum().item())
+                P = torch.cat([P_non_speech, P_non_keyword, P_keyword_id], dim=1)
                 return P
             
             # Step 2: Keyword vs. Non-keyword classification (within speech)
-            P_keyword = torch.sigmoid(self.keyword_branch(x))  # [batch, 1] -> P(keyword)
-            # print(f'P_keyword: {P_keyword}')
+            P_keyword = torch.sigmoid(self.keyword_branch(encoded))  # [batch, 1] -> P(keyword)
             if P_keyword.squeeze(0) < keyword_threshold:  # if non-keyword
                 P_non_keyword = torch.ones(1, 1, device=x.device)
-                P = torch.cat([P_non_speech, P_non_keyword, P_keyword_id], dim=1)  # [batch, 12]: 0.0, 1.0, 0.0, ..., 0.0
-                # print("Total probability 2:", P.sum().item())
+                P = torch.cat([P_non_speech, P_non_keyword, P_keyword_id], dim=1)
                 return P
                 
             # Step 3: Keyword classification (only if keyword is detected)
-            P_keyword_id = self.keyword_classification(x).softmax(dim=1) # [batch, 10] -> P(keyword_id)
-            # print(f'P_keyword_id: {P_keyword_id}')
-            P = torch.cat([P_non_speech, P_non_keyword, P_keyword_id], dim=1)  # [batch, 12]: 0.0, 0.0, 0.1, ..., 0.8
-            # print("Total Probability 3:", P.sum().item())
+            P_keyword_id = self.keyword_classification(encoded).softmax(dim=1)
+            P = torch.cat([P_non_speech, P_non_keyword, P_keyword_id], dim=1)
             return P

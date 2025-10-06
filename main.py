@@ -21,6 +21,7 @@ import umap
 import matplotlib.pyplot as plt
 from matplotlib.font_manager import FontProperties
 import gradio as gr
+import random
 
 from bcresnet import BCResNets
 from utils import DownloadDataset, Padding, Preprocess, SpeechCommand, SplitDataset
@@ -113,12 +114,12 @@ class Trainer:
                 for param_group in optimizer.param_groups:
                     param_group["lr"] = lr
 
-                # Extract inputs and labels
-                inputs, labels = sample
+                # Extract inputs, speaker embeddings, and labels
+                inputs, speaker_embeddings, labels, speaker_labels = sample
                 inputs = inputs.to(self.device)
-                # print(f'inputs: {inputs.shape}')
+                speaker_embeddings = speaker_embeddings.to(self.device)
                 labels = labels.to(self.device)
-                # print(f'labels: {labels.shape}, {labels}')
+                speaker_labels = speaker_labels.to(self.device)
 
                 # Define multi-level labels
                 speech_labels = (labels != 0).long().float()  # 0 -> non-speech, 1~11 -> speech
@@ -150,18 +151,18 @@ class Trainer:
                 embeddings = self.model.encode(inputs)
                 # print(f'all_embeddings: {embeddings.shape}')
                 
-                # Speech/non-speech classification
-                speech_outputs = self.model.speech_branch(embeddings)
-                # speech_outputs_prob = speech_outputs.softmax(dim=1)
-                # print(f'speech_outputs_prob: {speech_outputs_prob.shape}, {speech_outputs_prob}')
-
-                # Calculate speech loss
-                speech_loss = sigmoid_focal_loss(
-                    inputs=speech_outputs, 
-                    targets=speech_labels.unsqueeze(1), 
-                    alpha=speech_alpha, 
-                    reduction='mean'
-                )
+                # Get all outputs with speaker conditioning
+                speaker_outputs, keyword_outputs_raw, keyword_class_outputs_raw = self.model(inputs, speaker_embeddings)
+                
+                # Calculate speaker classification loss (3-class: same, different, silence)
+                # Count samples per class for focal loss alpha
+                speaker_class_counts = torch.bincount(speaker_labels, minlength=3)
+                speaker_alphas = 1.0 - (speaker_class_counts.float() / len(speaker_labels))
+                
+                # apply focal loss for speech_loss
+                ce_loss = F.cross_entropy(speaker_outputs, speaker_labels, reduction='none') # important to add reduction='none' to keep per-batch-item loss
+                pt = torch.exp(-ce_loss)
+                speech_loss = (speaker_alphas * (1-pt)**2 * ce_loss).mean() # mean over the batch
 
                 # Initialize keyword loss and keyword class loss
                 keyword_loss = torch.tensor(0.0, device=self.device)
@@ -169,10 +170,7 @@ class Trainer:
 
                 # Only process keyword/non-keyword classification when speech samples exist
                 if (labels >= 1).sum() > 0:
-                    speech_embeddings = embeddings[labels >= 1]
-                    # print(f'speech_embeddings: {speech_embeddings.shape}')
-                    keyword_outputs = self.model.keyword_branch(speech_embeddings)
-                    # print(f'keyword_outputs: {keyword_outputs.shape}, {keyword_outputs}')
+                    keyword_outputs = keyword_outputs_raw[labels >= 1]
                     
                     keyword_loss = sigmoid_focal_loss(
                         inputs=keyword_outputs, 
@@ -183,10 +181,7 @@ class Trainer:
 
                     # Only process keyword class classification when keyword samples exist
                     if (labels >= 2).sum() > 0:
-                        keyword_embeddings = embeddings[labels >= 2]
-                        # print(f'keyword_embeddings: {keyword_embeddings.shape}')
-                        keyword_class_outputs = self.model.keyword_classification(keyword_embeddings)
-                        # print(f'keyword_class_outputs: {keyword_class_outputs.shape}, {keyword_class_outputs}')
+                        keyword_class_outputs = keyword_class_outputs_raw[labels >= 2]
                         
                         softmax_loss = F.cross_entropy(
                             keyword_class_outputs, 
@@ -258,12 +253,15 @@ class Trainer:
         neg_total = 0
         confusion_mat = np.zeros((self.num_classes, self.num_classes))
 
-        for inputs, labels in loader:
+        for sample in loader:
+            inputs, speaker_embeddings, labels, speaker_labels = sample
+            speaker_embeddings = speaker_embeddings.to(self.device)
             inputs = inputs.to(self.device)
             labels = labels.to(self.device)
             # print(f'labels: {labels}')
             inputs = self.preprocess_test(inputs, labels=labels, is_train=False, augment=augment)
-            outputs = self.model.inference(inputs)  # already probabilities
+            # Use the first speaker embedding for inference (batch size 1 for test)
+            outputs = self.model.inference(inputs, speaker_embeddings[0])
             # print(f'outputs: {outputs}')
 
             # Collect all predictions and labels
@@ -339,14 +337,22 @@ class Trainer:
         valid_dir = "%s/valid_12class" % base_dir
         noise_dir = "%s/_background_noise_" % base_dir
 
+        # Paths to speaker embeddings
+        train_embeddings_path = os.path.join(os.path.dirname(__file__), "train_embeddings.pt")
+        valid_embeddings_path = os.path.join(os.path.dirname(__file__), "valid_embeddings.pt")
+        test_embeddings_path = os.path.join(os.path.dirname(__file__), "test_embeddings.pt")
+
         transform = transforms.Compose([Padding()])
-        self.train_dataset = SpeechCommand(train_dir, self.ver, transform=transform)
+        self.train_dataset = SpeechCommand(train_dir, self.ver, transform=transform, 
+                                          embeddings_path=train_embeddings_path)
         self.train_loader = DataLoader(
             self.train_dataset, batch_size=100, shuffle=True, num_workers=0, drop_last=False
         )
-        self.valid_dataset = SpeechCommand(valid_dir, self.ver, transform=transform)
+        self.valid_dataset = SpeechCommand(valid_dir, self.ver, transform=transform,
+                                          embeddings_path=valid_embeddings_path)
         self.valid_loader = DataLoader(self.valid_dataset, batch_size=1, num_workers=0)
-        self.test_dataset = SpeechCommand(test_dir, self.ver, transform=transform)
+        self.test_dataset = SpeechCommand(test_dir, self.ver, transform=transform,
+                                         embeddings_path=test_embeddings_path)
         self.test_loader = DataLoader(self.test_dataset, batch_size=1, num_workers=0)
         self.plot_loader = DataLoader(self.test_dataset, batch_size=100, num_workers=0)
 
@@ -577,7 +583,11 @@ class Trainer:
         all_embeddings = []
 
         with torch.no_grad():
-            for inputs, labels in self.plot_loader:
+            for sample in self.plot_loader:
+                if len(sample) == 4:  # New format
+                    inputs, speaker_embeddings, labels, speaker_labels = sample
+                else:  # Old format
+                    inputs, labels = sample
                 inputs = inputs.to(self.device)
                 inputs = self.preprocess_test(inputs, labels=labels, is_train=False, augment=False)
                 embeddings = self.model.encode(inputs)
@@ -620,7 +630,9 @@ class Trainer:
         sample = self.preprocess_test(x=sample, is_train=False, augment=False)
 
         with torch.no_grad():
-            probability = self.model.inference(sample)
+            # Use zero embedding for demo (no speaker verification)
+            speaker_embedding = torch.zeros(1, 512).to(self.device)
+            probability = self.model.inference(sample, speaker_embedding)
             speech_prediction = probability[0]
             keyword_prediction = probability[1]
             keyword_class_prediction = class_names[torch.argmax(probability[2:]).item()]
@@ -661,6 +673,9 @@ class Trainer:
 
 
 if __name__ == "__main__":
+    random.seed(42)
+    torch.manual_seed(42)
+    torch.cuda.manual_seed(42)
     _trainer = Trainer()
     if _trainer.eval:
         _trainer.Evaluation()

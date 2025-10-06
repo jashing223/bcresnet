@@ -14,6 +14,8 @@ import torch
 import torchaudio
 from torch.utils.data import Dataset
 
+from extract_embeddings import prepare_embedding
+
 ### GSC
 label_dict = {
     "_silence_": 0,
@@ -59,9 +61,34 @@ def ScanAudioFiles(root_dir, ver):
 class SpeechCommand(Dataset):
     """GSC"""
 
-    def __init__(self, root_dir, ver, transform=None):
+    def __init__(self, root_dir, ver, transform=None, embeddings_path=None):
         self.transform = transform
         self.data_list, self.labels = ScanAudioFiles(root_dir, ver)
+        
+        # Load speaker embeddings if provided
+        self.embeddings_dict = None
+        self.speaker_ids = []
+        if embeddings_path and os.path.exists(embeddings_path):
+            self.embeddings_dict = torch.load(embeddings_path)
+            # Extract speaker IDs from file paths
+            for audio_path in self.data_list:
+                speaker_id = self._get_speaker_id(audio_path)
+                self.speaker_ids.append(speaker_id)
+            # Get list of all unique speakers (excluding silence)
+            self.unique_speakers = list(set([
+                sid for sid in self.speaker_ids
+            ]))
+        else:
+            # If no embeddings, use zero vectors
+            print(f"Warning: No embeddings found at {embeddings_path}, using zero vectors")
+
+    def _get_speaker_id(self, filepath):
+        """Extract speaker ID from filename (first 8 characters)."""
+        basename = os.path.basename(filepath)
+        basename = basename.replace('.wav', '')
+        if len(basename) >= 8:
+            return basename[:8]
+        return basename
 
     def __len__(self):
         return len(self.labels)
@@ -72,7 +99,28 @@ class SpeechCommand(Dataset):
         if self.transform:
             sample = self.transform(sample)
         label = self.labels[idx]
-        return sample, label
+        
+        # Get speaker embedding
+        current_speaker_id = self.speaker_ids[idx]
+            
+        # Determine speaker label based on the keyword label
+        if label < 1:  # _silence_
+            # Use zero embedding for silence
+            speaker_embedding = self.embeddings_dict[current_speaker_id]
+            speaker_label = 2  # silence class
+        else:
+            # For actual speech samples, randomly decide same/different speaker
+            if random.random() < 0.5:
+                # Same speaker
+                speaker_embedding = self.embeddings_dict[current_speaker_id]
+            else:
+                # Different speaker - randomly select from other speakers
+                other_speakers = [s for s in self.unique_speakers if s != current_speaker_id]
+                different_speaker_id = random.choice(other_speakers)
+                speaker_embedding = self.embeddings_dict[different_speaker_id]
+                speaker_label = 1  # different speaker
+        
+        return sample, speaker_embedding, label, speaker_label
 
 
 def spec_augment(
@@ -311,3 +359,5 @@ def SplitDataset(loc):
             "%s/%s" % (target_loc, split_name), "%s/%s_12class" % (loc, split_name)
         )
         make_empty_audio("%s/%s_12class/_silence_" % (loc, split_name), sample_per_cls[idx])
+
+    prepare_embedding(loc)
