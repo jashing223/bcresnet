@@ -263,7 +263,8 @@ class BCResNets(nn.Module):
             Speaker classification logits (3 classes)
         """
         speaker_embedding = speaker_embedding.squeeze(1)
-        speaker_embedding = F.layer_norm(speaker_embedding)
+        speaker_embedding = F.normalize(speaker_embedding, p=2, dim=1)
+        # print(speaker_embedding.shape)
         x = self.film_layer(x, speaker_embedding)
         x = self.classifier1(x)
         x = x.view(-1, x.shape[1])
