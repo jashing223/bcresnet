@@ -107,12 +107,13 @@ class SpeechCommand(Dataset):
         if label < 1:  # _silence_
             # Use zero embedding for silence
             speaker_embedding = self.embeddings_dict[current_speaker_id]
-            speaker_label = 2  # silence class
+            speaker_label = 0  # silence class
         else:
             # For actual speech samples, randomly decide same/different speaker
             if random.random() < 0.5:
                 # Same speaker
                 speaker_embedding = self.embeddings_dict[current_speaker_id]
+                speaker_label = 2
             else:
                 # Different speaker - randomly select from other speakers
                 other_speakers = [s for s in self.unique_speakers if s != current_speaker_id]

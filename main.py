@@ -12,7 +12,10 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvision import transforms
 from tqdm import tqdm
-from sklearn.metrics import roc_auc_score, f1_score, confusion_matrix
+from sklearn.metrics import roc_auc_score, f1_score, confusion_matrix, roc_curve
+from sklearn.preprocessing import label_binarize
+from scipy.optimize import brentq
+from scipy.interpolate import interp1d
 import wandb
 from thop import profile
 import json
@@ -22,10 +25,12 @@ import matplotlib.pyplot as plt
 from matplotlib.font_manager import FontProperties
 import gradio as gr
 import random
+import warnings
 
 from bcresnet import BCResNets
 from utils import DownloadDataset, Padding, Preprocess, SpeechCommand, SplitDataset
 
+warnings.simplefilter('ignore', UserWarning)
 
 class Trainer:
     def __init__(self):
@@ -60,7 +65,7 @@ class Trainer:
         self.top_3_valid_accs = []
         
         # Create a directory to save checkpoints if it doesn't exist
-        self.checkpoint_dir = f"./checkpoints/sr_tau_{self.tau}_ver_{self.ver}"
+        self.checkpoint_dir = f"./checkpoints/pavd_sr_tau_{self.tau}_ver_{self.ver}"
         os.makedirs(self.checkpoint_dir, exist_ok=True)
 
         if self.eval and not self.ckpt:
@@ -73,10 +78,10 @@ class Trainer:
         Trains the model and presents the train/test progress.
         """
 
-        wandb.init(entity="jashing223-national-taiwan-normal-university", project="pkws", name=f'baseline_sr_tau_{self.tau}_ver_{self.ver}')
+        wandb.init(entity="jashing223-national-taiwan-normal-university", project="pkws", name=f'pvad_sr_tau_{self.tau}_ver_{self.ver}')
 
         # train hyperparameters
-        total_epoch = 200
+        total_epoch = 100
         warmup_epoch = 5
         init_lr = 1e-1
         lr_lower_limit = 0
@@ -154,15 +159,8 @@ class Trainer:
                 # Get all outputs with speaker conditioning
                 speaker_outputs, keyword_outputs_raw, keyword_class_outputs_raw = self.model(inputs, speaker_embeddings)
                 
-                # Calculate speaker classification loss (3-class: same, different, silence)
-                # Count samples per class for focal loss alpha
-                speaker_class_counts = torch.bincount(speaker_labels, minlength=3)
-                speaker_alphas = 1.0 - (speaker_class_counts.float() / len(speaker_labels))
-                
-                # apply focal loss for speech_loss
-                ce_loss = F.cross_entropy(speaker_outputs, speaker_labels, reduction='none') # important to add reduction='none' to keep per-batch-item loss
-                pt = torch.exp(-ce_loss)
-                speech_loss = (speaker_alphas * (1-pt)**2 * ce_loss).mean() # mean over the batch
+                # Calculate speaker classification loss (3-class: same, different, silence) weighted pairwise loss
+                speech_loss = self.wpl_loss(speaker_outputs, speaker_labels)
 
                 # Initialize keyword loss and keyword class loss
                 keyword_loss = torch.tensor(0.0, device=self.device)
@@ -202,21 +200,22 @@ class Trainer:
             # wandb.log({"LR": lr})
             with torch.no_grad():
                 self.model.eval()
-                valid_acc, valid_auroc, valid_f1, valid_fa = self.Test(self.valid_dataset, self.valid_loader, augment=True)
-                print(f"Valid - Acc: {valid_acc:.3f}, AUROC: {valid_auroc:.3f}, F1: {valid_f1:.3f}, FA: {valid_fa:.3f}")
+                valid_acc, valid_auroc, valid_f1, valid_fa, valid_eer = self.Test(self.valid_dataset, self.valid_loader, augment=True)
+                print(f"Valid - Acc: {valid_acc:.3f}, AUROC: {valid_auroc:.3f}, F1: {valid_f1:.3f}, FA: {valid_fa:.3f}, EER: {valid_eer:.3f}")
                 wandb.log({
                     "Epoch": epoch + 1,
                     "Valid_Acc": valid_acc,
                     "Valid_AUROC": valid_auroc,
                     "Valid_F1": valid_f1,
-                    "Valid_FA": valid_fa
+                    "Valid_FA": valid_fa,
+                    "Valid_EER": valid_eer
                 })
 
                 # Save checkpoint for top 3 validation accuracies
                 self._save_top_3_checkpoints(epoch, valid_acc)
 
-        test_acc, test_auroc, test_f1, test_fa = self.Test(self.test_dataset, self.test_loader, augment=False)  # official testset
-        print(f"Last ckpt test - Acc: {test_acc:.3f}, AUROC: {test_auroc:.3f}, F1: {test_f1:.3f}, FA: {test_fa:.3f}")
+        test_acc, test_auroc, test_f1, test_fa, test_eer = self.Test(self.test_dataset, self.test_loader, augment=False)  # official testset
+        print(f"Last ckpt test - Acc: {test_acc:.3f}, AUROC: {test_auroc:.3f}, F1: {test_f1:.3f}, FA: {test_fa:.3f}, EER: {test_eer:.3f}")
 
         # After training, test the best checkpoint
         self._test_best_checkpoint()
@@ -224,6 +223,41 @@ class Trainer:
         wandb.finish()
 
         print("End.")
+
+    def _binary_eer(self,y_true, y_score):
+        """計算 binary 的 EER"""
+        fpr, tpr, _ = roc_curve(y_true, y_score, pos_label=1)
+        return brentq(lambda x: 1. - x - interp1d(fpr, tpr)(x), 0., 1.)
+
+    def eer_score(self,y_true, y_score):
+        """
+        計算 Equal Error Rate (EER, %) for binary or multi-class (OVR only).
+        
+        參數:
+        - y_true: 一維 array-like, 標籤
+        - y_score: binary -> 一維預測分數
+                multi-class -> shape (n_samples, n_classes)，每類的分數
+
+        回傳:
+        - eer (百分比, float 或 list)
+        """
+        y_true = np.array(y_true)
+        y_score = np.array(y_score)
+
+        # Binary
+        if y_score.ndim == 1 or y_score.shape[1] == 1:
+            return self._binary_eer(y_true, y_score.ravel()) * 100.0
+
+        # Multi-class OVR
+        classes = np.unique(y_true)
+        y_true_bin = label_binarize(y_true, classes=classes)
+
+        eer_list = []
+        for i in range(len(classes)):
+            eer = self._binary_eer(y_true_bin[:, i], y_score[:, i])
+            eer_list.append(eer * 100.0)
+
+        return np.mean(eer_list)
 
     def Test(self, dataset, loader, augment):
         """
@@ -254,16 +288,21 @@ class Trainer:
         confusion_mat = np.zeros((self.num_classes, self.num_classes))
 
         for sample in loader:
-            inputs, speaker_embeddings, labels, speaker_labels = sample
+            inputs, speaker_embeddings, raw_labels, speaker_labels = sample
             speaker_embeddings = speaker_embeddings.to(self.device)
             inputs = inputs.to(self.device)
-            labels = labels.to(self.device)
-            # print(f'labels: {labels}')
-            inputs = self.preprocess_test(inputs, labels=labels, is_train=False, augment=augment)
-            # Use the first speaker embedding for inference (batch size 1 for test)
-            outputs = self.model.inference(inputs, speaker_embeddings[0])
-            # print(f'outputs: {outputs}')
+            speaker_labels = speaker_labels.to(self.device)
+            raw_labels = raw_labels.to(self.device)
 
+            # print(f'raw_labels: {raw_labels}')
+            inputs = self.preprocess_test(inputs, labels=raw_labels, is_train=False, augment=augment)
+            # Use the first speaker embedding for inference (batch size 1 for test)
+            outputs = self.model.inference(inputs, speaker_embeddings)
+            # print(f'outputs: {outputs}')
+            condition_mask = speaker_labels != 2
+            labels = torch.where(condition_mask, torch.tensor(0), raw_labels)
+            # print(f"speaker_labels: {speaker_labels}, condition_mask: {condition_mask}")
+            # print(f'labels: {labels}')
             # Collect all predictions and labels
             predictions = torch.argmax(outputs, dim=-1)
             # print(f'predictions: {predictions}')
@@ -289,6 +328,9 @@ class Trainer:
         else:
             auroc = roc_auc_score(np.array(all_labels), np.array(all_outputs), average='macro', multi_class='ovr') * 100.0
         
+        # calc eer score
+        eer = self.eer_score(all_labels, all_outputs)
+
         # F1-score calculation
         f1 = f1_score(np.array(all_labels), np.array(all_predictions), average='macro') * 100.0
         
@@ -301,7 +343,7 @@ class Trainer:
         else:
             fa = fa_count / neg_total * 100.0
 
-        return acc, auroc, f1, fa
+        return acc, auroc, f1, fa, eer
 
     def _load_data(self):
         """
@@ -311,9 +353,9 @@ class Trainer:
         """
 
         print("Check google speech commands dataset v1 or v2 ...")
-        if not os.path.isdir("/share/nas169/jethrowang/DB/GSC"):
-            os.mkdir("/share/nas169/jethrowang/DB/GSC")
-        base_dir = "/share/nas169/jethrowang/DB/GSC/speech_commands_v0.01"
+        if not os.path.isdir("/home/jashing223/datasets/GSC"):
+            os.mkdir("/home/jashing223/datasets/GSC")
+        base_dir = "/home/jashing223/datasets/GSC/speech_commands_v0.01"
         url = "https://storage.googleapis.com/download.tensorflow.org/data/speech_commands_v0.01.tar.gz"
         url_test = "https://storage.googleapis.com/download.tensorflow.org/data/speech_commands_test_set_v0.01.tar.gz"
         if self.ver == 2:
@@ -375,7 +417,7 @@ class Trainer:
 
     def _load_ckpt(self, ckpt_path, model):
         print(f'Loading model: {ckpt_path}')
-        ckpt = torch.load(ckpt_path)
+        ckpt = torch.load(ckpt_path, weights_only=False)
         model.load_state_dict(ckpt['model_state_dict'])
         model.eval()
 
@@ -442,7 +484,8 @@ class Trainer:
     def _calculate_macs(self, model):
         # Calculate MACs (Multiply-Accumulate Operations)
         input_sample = torch.randn(1, 1, 40, 87).to(self.device)
-        macs, _ = profile(model, inputs=(input_sample,), verbose=False)
+        input_embedding = torch.randn(1,1,512).to(self.device)
+        macs, _ = profile(model, inputs=(input_sample, input_embedding), verbose=False)
 
         return macs
 
@@ -464,7 +507,7 @@ class Trainer:
         print(f"Checkpoint path: {best_checkpoint_path}")
 
         # Load the best checkpoint
-        checkpoint = torch.load(best_checkpoint_path)
+        checkpoint = torch.load(best_checkpoint_path, weights_only=False)
         
         # Create a new model instance and load the state dict
         best_model = BCResNets(int(self.tau * 8)).to(self.device)
@@ -479,7 +522,7 @@ class Trainer:
 
         # Run test on the loaded model
         with torch.no_grad():
-            best_test_acc, best_test_auroc, best_test_f1, best_test_fa = self.Test(self.test_dataset, self.test_loader, augment=False)
+            best_test_acc, best_test_auroc, best_test_f1, best_test_fa, best_test_eer = self.Test(self.test_dataset, self.test_loader, augment=False)
             print(f"Best ckpt test - Acc: {best_test_acc:.3f}, AUROC: {best_test_auroc:.3f}, F1: {best_test_f1:.3f}, FA: {best_test_fa:.3f}")
         
         # Calculate number of parameters
@@ -494,6 +537,7 @@ class Trainer:
             'auroc': best_test_auroc,
             'f1-score': best_test_f1,
             'false_alarm': best_test_fa,
+            'EER': best_test_eer,
             'params': {
                 'total_params_k': total_params/1000,
                 'trainable_params_k': trainable_params/1000
@@ -508,6 +552,41 @@ class Trainer:
 
         # Restore the original model
         self.model = original_model
+    def wpl_loss(self, output, target, weights=torch.tensor([1.0, 0.5, 1.0])):
+        """Compute the WPL for a sequence.
+
+        Args:
+            output (torch.tensor): A tensor containing the model predictions.
+            target (torch.tensor): A 1D tensor containing the indices of the target classes.
+
+        Returns:
+            torch.tensor: A tensor containing the WPL value for the processed sequence.
+        """
+
+        output = torch.exp(output)
+        label_mask = F.one_hot(target) > 0.5 # boolean mask
+        label_mask_r1 = torch.roll(label_mask, 1, 1) # if ntss, then tss
+        label_mask_r2 = torch.roll(label_mask, 2, 1) # if ntss, then ns
+        weights = weights.to(self.device)
+
+        # get the probability of the actual label and the other two into one array
+        actual = torch.masked_select(output, label_mask)
+        plus_one = torch.masked_select(output, label_mask_r1)
+        minus_one = torch.masked_select(output, label_mask_r2)
+
+        # arrays of the first pair weight and the second pair weight used in the equation
+        w1 = torch.masked_select(weights, label_mask) # if ntss, w1 is <ntss, ns>
+        w2 = torch.masked_select(weights, label_mask_r1) # if ntss, w2 is <tss, ntss>
+
+        # first pair
+        first_pair = w1 * torch.log(actual / (actual + minus_one))
+        second_pair = w2 * torch.log(actual / (actual + plus_one))
+
+        # get the negative mean value for the two pairs
+        wpl = -0.5 * (first_pair + second_pair)
+
+        # sum and average for minibatch
+        return torch.mean(wpl) 
     
     def Evaluation(self):
         # Calculate number of parameters
@@ -518,10 +597,10 @@ class Trainer:
 
         # Perform evaluation
         with torch.no_grad():
-            eval_acc, eval_auroc, eval_f1, eval_fa = self.Test(self.test_dataset, self.test_loader, augment=False)
+            eval_acc, eval_auroc, eval_f1, eval_fa, eval_eer = self.Test(self.test_dataset, self.test_loader, augment=False)
             
         # Print results
-        print(f"Eval - Acc: {eval_acc:.3f}, AUROC: {eval_auroc:.3f}, F1: {eval_f1:.3f}, FA: {eval_fa:.3f}")
+        print(f"Eval - Acc: {eval_acc:.3f}, AUROC: {eval_auroc:.3f}, F1: {eval_f1:.3f}, FA: {eval_fa:.3f}, EER: {eval_eer:.3f}")
         print(f"Params - Total: {total_params/1000:.2f}k, Trainable: {trainable_params/1000:.2f}k")
         print(f"MACs: {macs/1e6:.2f}M")
 
@@ -531,6 +610,7 @@ class Trainer:
             'auroc': eval_auroc,
             'f1-score': eval_f1,
             'false_alarm': eval_fa,
+            'EER': eval_eer,
             'params': {
                 'total_params_k': total_params/1000,
                 'trainable_params_k': trainable_params/1000
@@ -584,15 +664,13 @@ class Trainer:
 
         with torch.no_grad():
             for sample in self.plot_loader:
-                if len(sample) == 4:  # New format
-                    inputs, speaker_embeddings, labels, speaker_labels = sample
-                else:  # Old format
-                    inputs, labels = sample
+                inputs, speaker_embeddings, labels, speaker_labels = sample
                 inputs = inputs.to(self.device)
                 inputs = self.preprocess_test(inputs, labels=labels, is_train=False, augment=False)
                 embeddings = self.model.encode(inputs)
                 all_labels.append(labels.numpy())
                 all_embeddings.append(embeddings.cpu().numpy())
+        
         
         all_labels = np.concatenate(all_labels, axis=0)
         all_embeddings = np.concatenate(all_embeddings, axis=0)

@@ -142,4 +142,4 @@ def prepare_embedding(base_dir: str):
 
 
 if __name__ == "__main__":
-    prepare_embedding()
+    prepare_embedding("/home/jashing223/datasets/GSC/speech_commands_v0.01")

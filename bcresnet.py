@@ -14,7 +14,7 @@ class FiLMLayer(nn.Module):
     Takes speaker embedding as input and generates gamma and beta
     for modulating the encoded features.
     """
-    def __init__(self, embedding_dim=512, feature_dim=20, hidden_dim=256):
+    def __init__(self, feature_dim, embedding_dim=64 , hidden_dim=256):
         super().__init__()
         self.embedding_dim = embedding_dim
         self.feature_dim = feature_dim
@@ -37,13 +37,13 @@ class FiLMLayer(nn.Module):
         Returns:
             Modulated features [batch, channels, height, width]
         """
-        batch_size = features.shape[0]
-        channels = features.shape[1]
+        gamma_beta = self.film_generator(embedding)
         
         # Generate gamma and beta
-        film_params = self.film_generator(embedding)  # [batch, channels * 2]
-        gamma = film_params[:, :channels].view(batch_size, channels, 1, 1)
-        beta = film_params[:, channels:].view(batch_size, channels, 1, 1)
+        gamma, beta = gamma_beta.chunk(2, dim=-1)
+
+        gamma = gamma.unsqueeze(-1).unsqueeze(-1)
+        beta = beta.unsqueeze(-1).unsqueeze(-1)
         
         # Apply FiLM modulation
         modulated = gamma * features + beta
@@ -252,7 +252,7 @@ class BCResNets(nn.Module):
 
         return x
     
-    def speech_branch(self, x, speaker_embedding=None):
+    def speech_branch(self, x, speaker_embedding):
         """Speaker classification branch with FiLM conditioning.
         
         Args:
@@ -262,8 +262,9 @@ class BCResNets(nn.Module):
         Returns:
             Speaker classification logits (3 classes)
         """
-        if speaker_embedding is not None:
-            x = self.film_layer(x, speaker_embedding)
+        speaker_embedding = speaker_embedding.squeeze(1)
+        speaker_embedding = F.layer_norm(speaker_embedding)
+        x = self.film_layer(x, speaker_embedding)
         x = self.classifier1(x)
         x = x.view(-1, x.shape[1])
         return x
@@ -302,7 +303,7 @@ class BCResNets(nn.Module):
         
         return speaker_logits, keyword_logits, keyword_class_logits
 
-    def inference(self, x, speaker_embedding, speech_threshold=0.1, keyword_threshold=0.5):  # batch = 1
+    def inference(self, x, speaker_embedding, keyword_threshold=0.5):  # batch = 1
         with torch.no_grad():
             # Define probabilities
             P_non_speech = P_non_keyword = torch.zeros(1, 1, device=x.device)
@@ -314,11 +315,9 @@ class BCResNets(nn.Module):
             # Get speaker classification (now includes speaker verification)
             # Note: We still use this for speech detection logic
             speaker_logits = self.speech_branch(encoded, speaker_embedding)
-            speaker_probs = F.softmax(speaker_logits, dim=1)
-            # only take target speaker speech
-            P_speech = speaker_probs[:, 0] 
+            speaker_probs = F.softmax(speaker_logits, dim=1)        
             
-            if P_speech.squeeze(0) < speech_threshold:  # if non-speech
+            if torch.argmax(speaker_probs, dim=-1) != 2:  # if non-speech
                 P_non_speech = torch.ones(1, 1, device=x.device)
                 P = torch.cat([P_non_speech, P_non_keyword, P_keyword_id], dim=1)
                 return P

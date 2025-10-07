@@ -1,2 +1,6 @@
-base/
 __pycache__/
+base/
+wandb/
+pretrain_models/
+*_embeddings.pt
+AGENTS.md
