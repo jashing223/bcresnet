@@ -14,7 +14,7 @@ class FiLMLayer(nn.Module):
     Takes speaker embedding as input and generates gamma and beta
     for modulating the encoded features.
     """
-    def __init__(self, feature_dim, embedding_dim=64 , hidden_dim=256):
+    def __init__(self, feature_dim, embedding_dim=512 , hidden_dim=64):
         super().__init__()
         self.embedding_dim = embedding_dim
         self.feature_dim = feature_dim
