@@ -14,7 +14,7 @@ class FiLMLayer(nn.Module):
     Takes speaker embedding as input and generates gamma and beta
     for modulating the encoded features.
     """
-    def __init__(self, feature_dim, embedding_dim=512 , hidden_dim=256):
+    def __init__(self, feature_dim, embedding_dim=192 , hidden_dim=128):
         super().__init__()
         self.embedding_dim = embedding_dim
         self.feature_dim = feature_dim
@@ -176,7 +176,7 @@ def BCBlockStage(num_layers, last_channel, cur_channel, idx, use_stride):
 
 
 class BCResNets(nn.Module):
-    def __init__(self, base_c, num_classes=12, embedding_dim=512):
+    def __init__(self, base_c, num_classes=12, embedding_dim=192):
         super().__init__()
         self.num_classes = num_classes
         self.embedding_dim = embedding_dim
@@ -317,7 +317,7 @@ class BCResNets(nn.Module):
             speaker_logits = self.speech_branch(encoded, speaker_embedding)
             speaker_probs = F.softmax(speaker_logits, dim=1)      
             
-            if torch.argmax(speaker_probs.squeeze(0)[2]):  # if non-speech
+            if torch.argmax(speaker_probs.squeeze(0)).item() != 2:  # if non-speech
                 P_non_speech = torch.ones(1, 1, device=x.device)
                 P = torch.cat([P_non_speech, P_non_keyword, P_keyword_id], dim=1)
                 return P

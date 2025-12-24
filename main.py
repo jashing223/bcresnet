@@ -26,6 +26,7 @@ from matplotlib.font_manager import FontProperties
 import gradio as gr
 import random
 import warnings
+import torchaudio
 
 from bcresnet import BCResNets
 from utils import DownloadDataset, Padding, Preprocess, SpeechCommand, SplitDataset
@@ -66,7 +67,7 @@ class Trainer:
         self.top_3_valid_accs = []
         
         # Create a directory to save checkpoints if it doesn't exist
-        self.checkpoint_dir = f"./checkpoints/pvad_sr_tau_{self.tau}_ver_{self.ver}_not_SV"
+        self.checkpoint_dir = f"./checkpoints/pvad_sr_tau_{self.tau}_ver_{self.ver}_ERes2NetV2"
         os.makedirs(self.checkpoint_dir, exist_ok=True)
 
         if self.eval and not self.ckpt:
@@ -79,7 +80,7 @@ class Trainer:
         Trains the model and presents the train/test progress.
         """
 
-        wandb.init(entity="jashing223-national-taiwan-normal-university", project="pkws", name=f'pvad_sr_tau_{self.tau}_ver_{self.ver}_not_SV')
+        wandb.init(entity="jashing223-national-taiwan-normal-university", project="pkws", name=f'pvad_sr_tau_{self.tau}_ver_{self.ver}_ERes2NetV2')
 
         # train hyperparameters
         total_epoch = 100
@@ -127,6 +128,11 @@ class Trainer:
                 labels = labels.to(self.device)
                 speaker_labels = speaker_labels.to(self.device)
 
+                # [關鍵修復] 標籤對齊：如果不是 Same Speaker 且不是靜音，標籤應歸零
+                # 必須在計算 speech_labels 之前執行，以解決 ValueError 維度不匹配
+                condition_mask = (speaker_labels == 2) | (labels == 0)
+                labels = torch.where(condition_mask, labels, torch.tensor(0).to(self.device))
+
                 # Define multi-level labels
                 speech_labels = (labels != 0).long().float()  # 0 -> non-speech, 1~11 -> speech
                 # print(f'speech_labels: {speech_labels.shape}, {speech_labels}')
@@ -149,12 +155,11 @@ class Trainer:
                     keyword_class_labels = labels[labels >= 2] - 2
                 # print(f'keyword_class_labels: {keyword_class_labels.shape}, {keyword_class_labels}')
 
+                condition_mask = (speaker_labels == 2) | (labels == 0)
+                labels = torch.where(condition_mask, labels, torch.tensor(0).to(self.device))
+
                 # Preprocess inputs
                 inputs = self.preprocess_train(inputs, labels, augment=True)
-                # print(f'processed_inputs: {inputs.shape}')
-
-                # Get embeddings
-                embeddings = self.model.encode(inputs)
                 # print(f'all_embeddings: {embeddings.shape}')
                 
                 # Get all outputs with speaker conditioning
@@ -300,14 +305,14 @@ class Trainer:
         confusion_mat = np.zeros((self.num_classes, self.num_classes))
 
         for sample in loader:
-            inputs, speaker_embeddings, labels, speaker_labels = sample
+            inputs, speaker_embeddings, raw_labels, speaker_labels = sample
             speaker_embeddings = speaker_embeddings.to(self.device)
             inputs = inputs.to(self.device)
             speaker_labels = speaker_labels.to(self.device)
-            raw_labels = labels.to(self.device)
+            raw_labels = raw_labels.to(self.device)
 
             # print(f'raw_labels: {raw_labels}')
-            inputs = self.preprocess_test(inputs, labels=labels, is_train=False, augment=augment)
+            inputs = self.preprocess_test(inputs, labels=raw_labels, is_train=False, augment=augment)
             # Use the first speaker embedding for inference (batch size 1 for test)
             outputs = self.model.inference(inputs, speaker_embeddings, speaker_threshold, keyword_threshold)
             # print(f'outputs: {outputs}')
@@ -496,7 +501,7 @@ class Trainer:
     def _calculate_macs(self, model):
         # Calculate MACs (Multiply-Accumulate Operations)
         input_sample = torch.randn(1, 1, 40, 87).to(self.device)
-        input_embedding = torch.randn(1,1,512).to(self.device)
+        input_embedding = torch.randn(1, 1, 192).to(self.device)
         macs, _ = profile(model, inputs=(input_sample, input_embedding), verbose=False)
 
         return macs
@@ -721,13 +726,10 @@ class Trainer:
 
         with torch.no_grad():
             # Use zero embedding for demo (no speaker verification)
-            speaker_embedding = torch.zeros(1, 512).to(self.device)
+            speaker_embedding = torch.zeros(1, 192).to(self.device)
             probability = self.model.inference(sample, speaker_embedding)
             speech_prediction = probability[0]
             keyword_prediction = probability[1]
-            keyword_class_prediction = class_names[torch.argmax(probability[2:]).item()]
-        
-        yield speech_prediction * 100, keyword_prediction * 100, keyword_class_prediction
 
     def Demo(self):
         with gr.Blocks() as demo:

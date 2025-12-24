@@ -105,8 +105,8 @@ class SpeechCommand(Dataset):
             
         # Determine speaker label based on the keyword label
         if label < 1:  # _silence_
-            # Use zero embedding for silence
-            speaker_embedding = self.embeddings_dict[current_speaker_id]
+            # [關鍵修正] 如果找不到靜音 ID，使用 192 維零向量，避免 Scale 爆炸
+            speaker_embedding = self.embeddings_dict.get(current_speaker_id, torch.zeros(192))
             speaker_label = 0  # silence class
         else:
             # For actual speech samples, randomly decide same/different speaker
