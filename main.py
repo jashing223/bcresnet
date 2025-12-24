@@ -143,10 +143,8 @@ class Trainer:
                 # Only process keyword labels when speech samples exist
                 if (labels >= 1).sum() > 0:
                     keyword_labels = (labels[labels >= 1] >= 2).long().float()  # 1 -> non-keyword, 2~11 -> keyword
-                    keyword_alpha = 1 - (keyword_labels.sum().item() / len(keyword_labels))  # positive ratio in keyword_labels
                     # keyword_alpha = max(0.1, min(keyword_alpha, 0.9))
-                else:
-                    keyword_alpha = 0
+                keyword_alpha = 0.25
                 # print(f'keyword_labels: {keyword_labels.shape}, {keyword_labels}')
                 # print(f'keyword_alpha: {keyword_alpha}')
 
@@ -182,10 +180,10 @@ class Trainer:
                     keyword_loss = sigmoid_focal_loss(
                         inputs=keyword_outputs, 
                         targets=keyword_labels.unsqueeze(1), 
-                        alpha=keyword_alpha, 
+                        alpha=0.25, # [建議] 鎖定 alpha。0.25 是 Focal Loss 論文針對類別不平衡的推薦值
+                        gamma=2.0,
                         reduction='mean'
                     )
-
                     # Only process keyword class classification when keyword samples exist
                     if (labels >= 2).sum() > 0:
                         keyword_class_outputs = keyword_class_outputs_raw[labels >= 2]
