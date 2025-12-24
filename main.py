@@ -52,6 +52,7 @@ class Trainer:
         parser.add_argument("--plot", help="Only run umap plot", action="store_true")
         parser.add_argument("--demo", help="Only run demo", action="store_true")
         parser.add_argument("--ckpt", help="Path to checkpoint file for evaluation", type=str, default="")
+        parser.add_argument("--optimal", help="Use grid search to find optimal threshold")
         args = parser.parse_args()
         self.__dict__.update(vars(args))
         self.device = torch.device("cuda:%d" % self.gpu if torch.cuda.is_available() else "cpu")
@@ -65,7 +66,7 @@ class Trainer:
         self.top_3_valid_accs = []
         
         # Create a directory to save checkpoints if it doesn't exist
-        self.checkpoint_dir = f"./checkpoints/pavd_sr_tau_{self.tau}_ver_{self.ver}"
+        self.checkpoint_dir = f"./checkpoints/pvad_sr_tau_{self.tau}_ver_{self.ver}_not_SV"
         os.makedirs(self.checkpoint_dir, exist_ok=True)
 
         if self.eval and not self.ckpt:
@@ -78,7 +79,7 @@ class Trainer:
         Trains the model and presents the train/test progress.
         """
 
-        wandb.init(entity="jashing223-national-taiwan-normal-university", project="pkws", name=f'pvad_sr_tau_{self.tau}_ver_{self.ver}')
+        wandb.init(entity="jashing223-national-taiwan-normal-university", project="pkws", name=f'pvad_sr_tau_{self.tau}_ver_{self.ver}_not_SV')
 
         # train hyperparameters
         total_epoch = 100
@@ -160,7 +161,10 @@ class Trainer:
                 speaker_outputs, keyword_outputs_raw, keyword_class_outputs_raw = self.model(inputs, speaker_embeddings)
                 
                 # Calculate speaker classification loss (3-class: same, different, silence) weighted pairwise loss
-                speech_loss = self.wpl_loss(speaker_outputs, speaker_labels)
+                speech_loss = F.cross_entropy(
+                    speaker_outputs,
+                    speaker_labels
+                )
 
                 # Initialize keyword loss and keyword class loss
                 keyword_loss = torch.tensor(0.0, device=self.device)
@@ -213,6 +217,14 @@ class Trainer:
 
                 # Save checkpoint for top 3 validation accuracies
                 self._save_top_3_checkpoints(epoch, valid_acc)
+                if epoch > 80:
+                    checkpoint_path = os.path.join(self.checkpoint_dir, f'model_epoch_{epoch+1}_acc_{valid_acc:.2f}.ckpt')
+                    checkpoint = {
+                        'epoch': epoch + 1,
+                        'model_state_dict': self.model.state_dict(),
+                        'valid_acc': valid_acc
+                    }
+                    torch.save(checkpoint, checkpoint_path)
 
         test_acc, test_auroc, test_f1, test_fa, test_eer = self.Test(self.test_dataset, self.test_loader, augment=False)  # official testset
         print(f"Last ckpt test - Acc: {test_acc:.3f}, AUROC: {test_auroc:.3f}, F1: {test_f1:.3f}, FA: {test_fa:.3f}, EER: {test_eer:.3f}")
@@ -259,7 +271,7 @@ class Trainer:
 
         return np.mean(eer_list)
 
-    def Test(self, dataset, loader, augment):
+    def Test(self, dataset, loader, augment, speaker_threshold = 0.3, keyword_threshold = 0.5):
         """
         Tests the model on a given dataset and calculates accuracy, AUROC, F1-score, and false alarm rate.
 
@@ -288,16 +300,16 @@ class Trainer:
         confusion_mat = np.zeros((self.num_classes, self.num_classes))
 
         for sample in loader:
-            inputs, speaker_embeddings, raw_labels, speaker_labels = sample
+            inputs, speaker_embeddings, labels, speaker_labels = sample
             speaker_embeddings = speaker_embeddings.to(self.device)
             inputs = inputs.to(self.device)
             speaker_labels = speaker_labels.to(self.device)
-            raw_labels = raw_labels.to(self.device)
+            raw_labels = labels.to(self.device)
 
             # print(f'raw_labels: {raw_labels}')
-            inputs = self.preprocess_test(inputs, labels=raw_labels, is_train=False, augment=augment)
+            inputs = self.preprocess_test(inputs, labels=labels, is_train=False, augment=augment)
             # Use the first speaker embedding for inference (batch size 1 for test)
-            outputs = self.model.inference(inputs, speaker_embeddings)
+            outputs = self.model.inference(inputs, speaker_embeddings, speaker_threshold, keyword_threshold)
             # print(f'outputs: {outputs}')
             condition_mask = speaker_labels != 2
             labels = torch.where(condition_mask, torch.tensor(0), raw_labels)
@@ -523,7 +535,7 @@ class Trainer:
         # Run test on the loaded model
         with torch.no_grad():
             best_test_acc, best_test_auroc, best_test_f1, best_test_fa, best_test_eer = self.Test(self.test_dataset, self.test_loader, augment=False)
-            print(f"Best ckpt test - Acc: {best_test_acc:.3f}, AUROC: {best_test_auroc:.3f}, F1: {best_test_f1:.3f}, FA: {best_test_fa:.3f}")
+            print(f"Best ckpt test - Acc: {best_test_acc:.3f}, AUROC: {best_test_auroc:.3f}, F1: {best_test_f1:.3f}, FA: {best_test_fa:.3f}, EER: {best_test_eer:.3f}")
         
         # Calculate number of parameters
         total_params, trainable_params = self._calculate_params(self.model)
@@ -748,7 +760,24 @@ class Trainer:
         demo.queue()  # Enable queue to support generators
         demo.launch(share=True)
 
-
+    def Grid_search(self):
+        best_eer = 0
+        with torch.no_grad():
+            self.model.eval()
+            for speaker_threshold in range(0, 1, 0.01):
+                valid_acc, valid_auroc, valid_f1, valid_fa, valid_eer = self.Test(self.valid_dataset, self.valid_loader, augment=True, speaker_threshold=speaker_threshold, keyword_threshold=0.5)
+                if valid_eer > best_eer:
+                    best_eer = valid_eer
+                
+            test_acc, test_auroc, test_f1, test_fa, test_eer = self.Test(self.test_dataset, self.test_loader, augment=True)
+            print(f"test - Acc: {test_acc:.3f}, AUROC: {test_auroc:.3f}, F1: {test_f1:.3f}, FA: {test_fa:.3f}, EER: {test_eer:.3f}")
+            print({
+                "test_Acc": test_acc,
+                "test_AUROC": test_auroc,
+                "test_F1": test_f1,
+                "test_FA": test_fa,
+                "test_EER": test_eer
+            })
 
 if __name__ == "__main__":
     random.seed(42)
@@ -761,5 +790,7 @@ if __name__ == "__main__":
         _trainer.Plot()
     elif _trainer.demo:
         _trainer.Demo()
+    elif _trainer.optimal:
+        _trainer.Grid_search()
     else:
         _trainer()

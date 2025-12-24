@@ -14,7 +14,7 @@ class FiLMLayer(nn.Module):
     Takes speaker embedding as input and generates gamma and beta
     for modulating the encoded features.
     """
-    def __init__(self, feature_dim, embedding_dim=512 , hidden_dim=64):
+    def __init__(self, feature_dim, embedding_dim=512 , hidden_dim=256):
         super().__init__()
         self.embedding_dim = embedding_dim
         self.feature_dim = feature_dim
@@ -263,7 +263,6 @@ class BCResNets(nn.Module):
             Speaker classification logits (3 classes)
         """
         speaker_embedding = speaker_embedding.squeeze(1)
-        speaker_embedding = F.normalize(speaker_embedding, p=2, dim=1)
         # print(speaker_embedding.shape)
         x = self.film_layer(x, speaker_embedding)
         x = self.classifier1(x)
@@ -304,7 +303,7 @@ class BCResNets(nn.Module):
         
         return speaker_logits, keyword_logits, keyword_class_logits
 
-    def inference(self, x, speaker_embedding, keyword_threshold=0.5):  # batch = 1
+    def inference(self, x, speaker_embedding, speech_threshold = 0.1, keyword_threshold=0.5):  # batch = 1
         with torch.no_grad():
             # Define probabilities
             P_non_speech = P_non_keyword = torch.zeros(1, 1, device=x.device)
@@ -316,9 +315,9 @@ class BCResNets(nn.Module):
             # Get speaker classification (now includes speaker verification)
             # Note: We still use this for speech detection logic
             speaker_logits = self.speech_branch(encoded, speaker_embedding)
-            speaker_probs = F.softmax(speaker_logits, dim=1)        
+            speaker_probs = F.softmax(speaker_logits, dim=1)      
             
-            if torch.argmax(speaker_probs, dim=-1) != 2:  # if non-speech
+            if torch.argmax(speaker_probs.squeeze(0)[2]):  # if non-speech
                 P_non_speech = torch.ones(1, 1, device=x.device)
                 P = torch.cat([P_non_speech, P_non_keyword, P_keyword_id], dim=1)
                 return P

@@ -4,3 +4,4 @@ wandb/
 pretrain_models/
 *_embeddings.pt
 AGENTS.md
+checkpoints/
