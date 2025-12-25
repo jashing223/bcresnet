@@ -53,7 +53,7 @@ class Trainer:
         parser.add_argument("--plot", help="Only run umap plot", action="store_true")
         parser.add_argument("--demo", help="Only run demo", action="store_true")
         parser.add_argument("--ckpt", help="Path to checkpoint file for evaluation", type=str, default="")
-        parser.add_argument("--optimal", help="Use grid search to find optimal threshold")
+        parser.add_argument("--optimal", help="Use grid search to find optimal threshold", action="store_true")
         args = parser.parse_args()
         self.__dict__.update(vars(args))
         self.device = torch.device("cuda:%d" % self.gpu if torch.cuda.is_available() else "cpu")
@@ -80,12 +80,12 @@ class Trainer:
         Trains the model and presents the train/test progress.
         """
 
-        wandb.init(entity="jashing223-national-taiwan-normal-university", project="pkws", name=f'pvad_sr_tau_{self.tau}_ver_{self.ver}_ERes2NetV2')
+        wandb.init(entity="jashing223-national-taiwan-normal-university", project="pkws", name=f'pvad_sr_tau_{self.tau}_ver_{self.ver}_ERes2NetV2_concat_2_0.5')
 
         # train hyperparameters
         total_epoch = 100
         warmup_epoch = 5
-        init_lr = 1e-1
+        init_lr = 0.1
         lr_lower_limit = 0
 
         # optimizer
@@ -200,6 +200,7 @@ class Trainer:
                 # Backpropagation and weight update
                 optimizer.zero_grad()
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 optimizer.step()
 
             # valid
@@ -778,6 +779,113 @@ class Trainer:
                 "test_FA": test_fa,
                 "test_EER": test_eer
             })
+    def find_optimal_threshold(self):
+        print(f"Searching for checkpoints in {self.checkpoint_dir} ...")
+        
+        # 1. 搜尋所有 .ckpt 檔案
+        ckpt_pattern = os.path.join(self.checkpoint_dir, "*.ckpt")
+        ckpts = glob(ckpt_pattern)
+        
+        # 排序：嘗試依照 epoch 數字排序 (假設檔名格式為 model_epoch_X_acc_Y.ckpt)
+        def get_epoch(path):
+            try:
+                base = os.path.basename(path)
+                return int(base.split("model_epoch_")[1].split("_")[0])
+            except:
+                return -1 # 無法解析就排在最前面
+        
+        ckpts = sorted(ckpts, key=get_epoch)
+        
+        if not ckpts:
+            print("No checkpoints found.")
+            return
+
+        print(f"Found {len(ckpts)} checkpoints. Starting batch optimization...")
+        
+        # 用來儲存所有結果的列表
+        summary_results = []
+
+        # 定義搜尋區間 (Speaker Threshold 固定 0.3, 搜尋 Keyword Threshold)
+        # 根據經驗，FA 高時閾值通常在 0.5 ~ 0.95 之間
+        thresholds = np.arange(0.3, 1.0, 0.05) 
+
+        # 2. 遍歷每個 Checkpoint
+        for ckpt_path in ckpts:
+            ckpt_name = os.path.basename(ckpt_path)
+            print(f"\n{'='*20}\nProcessing: {ckpt_name}\n{'='*20}")
+            
+            try:
+                # 載入模型權重
+                checkpoint = torch.load(ckpt_path, map_location=self.device, weights_only=False)
+                self.model.load_state_dict(checkpoint['model_state_dict'])
+                self.model.eval()
+            except Exception as e:
+                print(f"Error loading {ckpt_name}: {e}")
+                continue
+            
+            best_valid_acc = 0.0
+            best_th = 0.5
+            best_valid_fa = 100.0
+            
+            # 在 Validation Set 上尋找最佳閾值
+            with torch.no_grad():
+                for th in thresholds:
+                    valid_acc, _, _, valid_fa, _ = self.Test(
+                        self.valid_dataset, 
+                        self.valid_loader, 
+                        augment=False, 
+                        speaker_threshold=0.3, # 固定 Speaker 閾值
+                        keyword_threshold=th   # 變動 Keyword 閾值
+                    )
+                    
+                    # 簡單的進度條輸出
+                    # print(f"  Th: {th:.2f} | Acc: {valid_acc:.2f}% | FA: {valid_fa:.2f}%")
+                    
+                    if valid_acc > best_valid_acc:
+                        best_valid_acc = valid_acc
+                        best_th = th
+                        best_valid_fa = valid_fa
+            
+            print(f"✅ Best Valid Found -> Th: {best_th:.2f} | Acc: {best_valid_acc:.2f}% | FA: {best_valid_fa:.2f}%")
+            
+            # 3. 用找到的最佳閾值測試 Test Set (Official Test Set)
+            test_acc, test_auroc, test_f1, test_fa, test_eer = self.Test(
+                self.test_dataset, 
+                self.test_loader, 
+                augment=False, 
+                speaker_threshold=0.3,
+                keyword_threshold=best_th
+            )
+            print(f"🚀 Test Result      -> Acc: {test_acc:.3f} | FA: {test_fa:.3f}")
+            
+            # 記錄結果
+            summary_results.append({
+                "ckpt": ckpt_name,
+                "epoch": get_epoch(ckpt_path),
+                "best_th": best_th,
+                "valid_acc": best_valid_acc,
+                "test_acc": test_acc,
+                "test_fa": test_fa,
+                "test_eer": test_eer
+            })
+
+        # 4. 輸出總結報表
+        print("\n\n" + "="*80)
+        print(f"{'Checkpoint':<35} | {'Best Th':<8} | {'Val Acc':<8} | {'Test Acc':<8} | {'Test FA':<8} | {'Test EER':<8}")
+        print("-" * 80)
+        
+        # 依 Test Acc 排序輸出 (或是依 Epoch 排序)
+        # 這裡依 Epoch 排序方便看趨勢
+        for res in summary_results:
+            print(f"{res['ckpt']:<35} | {res['best_th']:<8.2f} | {res['valid_acc']:<8.2f} | {res['test_acc']:<8.2f} | {res['test_fa']:<8.2f} | {res['test_eer']:<8.2f}")
+        print("="*80)
+
+        # 找出 Test Acc 最高的模型
+        best_model = max(summary_results, key=lambda x: x['test_acc'])
+        print(f"\n🏆 Overall Best Model: {best_model['ckpt']}")
+        print(f"   With Threshold: {best_model['best_th']:.2f}")
+        print(f"   Test Acc: {best_model['test_acc']:.2f}%")
+        print(f"   Test FA:  {best_model['test_fa']:.2f}%")
 
 if __name__ == "__main__":
     random.seed(42)
@@ -790,7 +898,7 @@ if __name__ == "__main__":
         _trainer.Plot()
     elif _trainer.demo:
         _trainer.Demo()
-    elif _trainer.optimal:
-        _trainer.Grid_search()
+    elif _trainer.optimal: 
+         _trainer.find_optimal_threshold()
     else:
         _trainer()
