@@ -273,7 +273,7 @@ class BCResNets(nn.Module):
         
         return speaker_logits, keyword_logits, keyword_class_logits
 
-    def inference(self, x, speaker_embedding, speech_threshold = 0.1, keyword_threshold=0.5):
+    def inference(self, x, speaker_embedding, speech_threshold=0.1, keyword_threshold=0.5):
         with torch.no_grad():
             # Define probabilities
             P_non_speech = P_non_keyword = torch.zeros(1, 1, device=x.device)
@@ -282,22 +282,28 @@ class BCResNets(nn.Module):
             # Extract embeddings
             encoded = self.encode(x)
             
-            # Normalize embedding
+            # [重要] Inference 時也要記得 Normalize Embedding (保持與 Training 一致)
             speaker_embedding = F.normalize(speaker_embedding, p=2, dim=-1)
 
-            # Get speaker classification (Late Fusion)
-            # 注意: 這裡 inference 不用 detach (因為不傳梯度)，但邏輯一樣
+            # Get speaker classification
             speaker_logits = self.speech_branch(encoded, speaker_embedding)
             speaker_probs = F.softmax(speaker_logits, dim=1)      
             
-            if torch.argmax(speaker_probs.squeeze(0)).item() != 2:  # if non-speech / different speaker
+            # [修正] 啟用 speech_threshold
+            # 原本邏輯: if torch.argmax(speaker_probs.squeeze(0)).item() != 2:
+            # 修正邏輯: 檢查 Class 2 (Same Speaker) 的機率是否小於閾值
+            
+            # speaker_probs shape: [1, 3] -> 取出 [0, 2] 即 Target Speaker 的機率
+            target_speaker_prob = speaker_probs[0, 2]
+            
+            if target_speaker_prob < speech_threshold:  # 如果信心度不足，視為非目標
                 P_non_speech = torch.ones(1, 1, device=x.device)
                 P = torch.cat([P_non_speech, P_non_keyword, P_keyword_id], dim=1)
                 return P
             
             # Step 2: Keyword vs. Non-keyword classification
             P_keyword = torch.sigmoid(self.keyword_branch(encoded))
-            if P_keyword.squeeze(0) < keyword_threshold:  # if non-keyword
+            if P_keyword.squeeze(0) < keyword_threshold:
                 P_non_keyword = torch.ones(1, 1, device=x.device)
                 P = torch.cat([P_non_speech, P_non_keyword, P_keyword_id], dim=1)
                 return P

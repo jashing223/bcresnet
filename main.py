@@ -782,108 +782,183 @@ class Trainer:
     def find_optimal_threshold(self):
         print(f"Searching for checkpoints in {self.checkpoint_dir} ...")
         
-        # 1. 搜尋所有 .ckpt 檔案
         ckpt_pattern = os.path.join(self.checkpoint_dir, "*.ckpt")
         ckpts = glob(ckpt_pattern)
         
-        # 排序：嘗試依照 epoch 數字排序 (假設檔名格式為 model_epoch_X_acc_Y.ckpt)
         def get_epoch(path):
             try:
                 base = os.path.basename(path)
                 return int(base.split("model_epoch_")[1].split("_")[0])
             except:
-                return -1 # 無法解析就排在最前面
+                return -1 
         
         ckpts = sorted(ckpts, key=get_epoch)
-        
         if not ckpts:
             print("No checkpoints found.")
             return
 
-        print(f"Found {len(ckpts)} checkpoints. Starting batch optimization...")
+        print(f"Found {len(ckpts)} checkpoints. Starting Two-Stage Optimization (EER-First)...")
         
-        # 用來儲存所有結果的列表
         summary_results = []
-
-        # 定義搜尋區間 (Speaker Threshold 固定 0.3, 搜尋 Keyword Threshold)
-        # 根據經驗，FA 高時閾值通常在 0.5 ~ 0.95 之間
-        thresholds = np.arange(0.3, 1.0, 0.05) 
-
-        # 2. 遍歷每個 Checkpoint
-        for ckpt_path in ckpts:
+        th_range = np.arange(0.01, 1.0, 0.01) # 解析度 0.01
+        
+        pbar_ckpt = tqdm(ckpts, desc="Checkpoints", position=0, leave=True)
+        
+        for ckpt_path in pbar_ckpt:
             ckpt_name = os.path.basename(ckpt_path)
-            print(f"\n{'='*20}\nProcessing: {ckpt_name}\n{'='*20}")
+            pbar_ckpt.set_description(f"Processing {ckpt_name}")
             
             try:
-                # 載入模型權重
+                # weights_only=False
                 checkpoint = torch.load(ckpt_path, map_location=self.device, weights_only=False)
                 self.model.load_state_dict(checkpoint['model_state_dict'])
                 self.model.eval()
             except Exception as e:
-                print(f"Error loading {ckpt_name}: {e}")
+                tqdm.write(f"\n❌ Skipping {ckpt_name}: {e}")
                 continue
             
-            best_valid_acc = 0.0
-            best_th = 0.5
-            best_valid_fa = 100.0
+            # --- 階段 1: 資料收集 ---
+            val_labels = []
+            val_spk_conf = []
+            val_kw_conf = []
+            val_cls_preds = []
             
-            # 在 Validation Set 上尋找最佳閾值
-            with torch.no_grad():
-                for th in thresholds:
-                    valid_acc, _, _, valid_fa, _ = self.Test(
-                        self.valid_dataset, 
-                        self.valid_loader, 
-                        augment=False, 
-                        speaker_threshold=0.3, # 固定 Speaker 閾值
-                        keyword_threshold=th   # 變動 Keyword 閾值
-                    )
-                    
-                    # 簡單的進度條輸出
-                    # print(f"  Th: {th:.2f} | Acc: {valid_acc:.2f}% | FA: {valid_fa:.2f}%")
-                    
-                    if valid_acc > best_valid_acc:
-                        best_valid_acc = valid_acc
-                        best_th = th
-                        best_valid_fa = valid_fa
+            # 用來計算 SV-EER 的標籤 (0=Diff Speaker, 1=Same Speaker)
+            val_sv_labels = [] 
             
-            print(f"✅ Best Valid Found -> Th: {best_th:.2f} | Acc: {best_valid_acc:.2f}% | FA: {best_valid_fa:.2f}%")
-            
-            # 3. 用找到的最佳閾值測試 Test Set (Official Test Set)
-            test_acc, test_auroc, test_f1, test_fa, test_eer = self.Test(
-                self.test_dataset, 
-                self.test_loader, 
-                augment=False, 
-                speaker_threshold=0.3,
-                keyword_threshold=best_th
-            )
-            print(f"🚀 Test Result      -> Acc: {test_acc:.3f} | FA: {test_fa:.3f}")
-            
-            # 記錄結果
-            summary_results.append({
-                "ckpt": ckpt_name,
-                "epoch": get_epoch(ckpt_path),
-                "best_th": best_th,
-                "valid_acc": best_valid_acc,
-                "test_acc": test_acc,
-                "test_fa": test_fa,
-                "test_eer": test_eer
-            })
+            try:
+                with torch.no_grad():
+                    temp_loader = DataLoader(self.valid_dataset, batch_size=100, num_workers=4, shuffle=False)
+                    for sample in temp_loader:
+                        inputs, embeddings, labels, _ = sample
+                        inputs = inputs.to(self.device)
+                        embeddings = embeddings.to(self.device)
+                        
+                        inputs = self.preprocess_test(inputs, labels=labels, is_train=False, augment=False)
+                        embeddings = F.normalize(embeddings, p=2, dim=-1)
+                        encoded = self.model.encode(inputs)
 
-        # 4. 輸出總結報表
-        print("\n\n" + "="*80)
-        print(f"{'Checkpoint':<35} | {'Best Th':<8} | {'Val Acc':<8} | {'Test Acc':<8} | {'Test FA':<8} | {'Test EER':<8}")
-        print("-" * 80)
+                        spk_probs = F.softmax(self.model.speech_branch(encoded, embeddings), dim=1)
+                        target_spk_conf = spk_probs[:, 2] 
+
+                        kw_conf = torch.sigmoid(self.model.keyword_branch(encoded)).squeeze(1)
+                        cls_pred = torch.argmax(self.model.keyword_classification(encoded), dim=1) + 2 
+
+                        val_labels.append(labels.cpu().numpy())
+                        val_spk_conf.append(target_spk_conf.cpu().numpy())
+                        val_kw_conf.append(kw_conf.cpu().numpy())
+                        val_cls_preds.append(cls_pred.cpu().numpy())
+                        
+                        # 製作 SV Label: 假設 Dataset 有提供 speaker label
+                        # 但在這裡我們通常假設:
+                        # Validation Set 的 Keyword 樣本都是 Target Speaker (2)
+                        # Unknown 樣本可能是 Diff Speaker (1)
+                        # 這取決於你的 Validation Set 建構方式。
+                        # 如果無法從 labels 區分 SV 真值，我們只能用一個近似：
+                        # 在你的 dataset 中，labels >= 2 都是 Target Speaker
+                        # labels == 1 (Unknown) 可能是 Target 也可能是 Imposter
+                        # 這是一個潛在問題點。
+                        
+                        # [假設] 這裡我們使用 labels >= 2 作為 "Same Speaker" (Positive)
+                        # labels == 0 or 1 作為 "Diff Speaker / Non-Speech" (Negative)
+                        # 這是一個粗略的 SV 測試
+                        current_sv_label = (labels >= 2).long().cpu().numpy()
+                        val_sv_labels.append(current_sv_label)
+
+                val_labels = np.concatenate(val_labels)
+                val_spk_conf = np.concatenate(val_spk_conf)
+                val_kw_conf = np.concatenate(val_kw_conf)
+                val_cls_preds = np.concatenate(val_cls_preds)
+                val_sv_labels = np.concatenate(val_sv_labels)
+
+                # --- 階段 2: Two-Stage Optimization ---
+                
+                # Step 1: Optimize Speech Threshold (Target: Min EER / Max SV Acc)
+                # 這裡我們尋找一個閾值，能最好地區分 (Keyword) 和 (Unknown/Silence)
+                # 雖然這混雜了 Keyword 資訊，但這是目前唯一可用的 SV Proxy
+                
+                best_th_s = 0.5
+                best_sv_acc = 0.0
+                
+                # 為了避免選到 0.0，我們強制搜尋範圍
+                for th_s in th_range:
+                    pred_sv = (val_spk_conf >= th_s).astype(int)
+                    sv_acc = np.mean(pred_sv == val_sv_labels)
+                    if sv_acc > best_sv_acc:
+                        best_sv_acc = sv_acc
+                        best_th_s = th_s
+                
+                # Step 2: Optimize Keyword Threshold (Target: Max Overall Acc)
+                # 固定 th_s，掃描 th_k
+                best_acc = 0.0
+                best_fa = 100.0
+                best_th_k = 0.5
+                
+                for th_k in th_range:
+                    pass_mask = (val_spk_conf >= best_th_s) & (val_kw_conf >= th_k)
+                    
+                    final_preds = np.ones_like(val_labels) # Default Unknown
+                    final_preds[pass_mask] = val_cls_preds[pass_mask]
+                    
+                    # Align Labels (0 -> 1 for eval)
+                    eval_labels = val_labels.copy()
+                    eval_labels[eval_labels == 0] = 1
+                    
+                    acc = np.mean(final_preds == eval_labels) * 100.0
+                    
+                    neg_indices = (val_labels <= 1)
+                    if np.sum(neg_indices) > 0:
+                        fa_count = np.sum(final_preds[neg_indices] >= 2)
+                        fa = (fa_count / np.sum(neg_indices)) * 100.0
+                    else:
+                        fa = 0.0
+                        
+                    if acc > best_acc:
+                        best_acc = acc
+                        best_fa = fa
+                        best_th_k = th_k
+                
+                tqdm.write(f"✅ {ckpt_name} -> Best Th(S/K): {best_th_s:.2f}/{best_th_k:.2f} | Val Acc: {best_acc:.2f}% | SV Acc: {best_sv_acc*100:.2f}%")
+                
+                # --- 階段 3: Test Set ---
+                test_acc, _, _, test_fa, test_eer = self.Test(
+                    self.test_dataset, 
+                    self.test_loader, 
+                    augment=False, 
+                    speaker_threshold=best_th_s,
+                    keyword_threshold=best_th_k
+                )
+                
+                summary_results.append({
+                    "ckpt": ckpt_name,
+                    "best_th_s": best_th_s,
+                    "best_th_k": best_th_k,
+                    "test_acc": test_acc,
+                    "test_fa": test_fa
+                })
+            
+            except Exception as e:
+                tqdm.write(f"❌ Error processing {ckpt_name}: {e}")
+                continue
+
+        if not summary_results:
+            print("\n⚠️ No checkpoints processed.")
+            return
+
+        print("\n\n" + "="*100)
+        print(f"{'Checkpoint':<30} | {'Th(Spk/Kw)':<12} | {'Test Acc':<8} | {'Test FA':<8}")
+        print("-" * 100)
         
-        # 依 Test Acc 排序輸出 (或是依 Epoch 排序)
-        # 這裡依 Epoch 排序方便看趨勢
+        summary_results.sort(key=lambda x: x['test_acc'], reverse=True)
+        
         for res in summary_results:
-            print(f"{res['ckpt']:<35} | {res['best_th']:<8.2f} | {res['valid_acc']:<8.2f} | {res['test_acc']:<8.2f} | {res['test_fa']:<8.2f} | {res['test_eer']:<8.2f}")
-        print("="*80)
+            th_str = f"{res['best_th_s']:.2f}/{res['best_th_k']:.2f}"
+            print(f"{res['ckpt']:<30} | {th_str:<12} | {res['test_acc']:<8.2f} | {res['test_fa']:<8.2f}")
+        print("="*100)
 
-        # 找出 Test Acc 最高的模型
-        best_model = max(summary_results, key=lambda x: x['test_acc'])
+        best_model = summary_results[0]
         print(f"\n🏆 Overall Best Model: {best_model['ckpt']}")
-        print(f"   With Threshold: {best_model['best_th']:.2f}")
+        print(f"   Best Thresholds: Spk={best_model['best_th_s']:.2f}, Kw={best_model['best_th_k']:.2f}")
         print(f"   Test Acc: {best_model['test_acc']:.2f}%")
         print(f"   Test FA:  {best_model['test_fa']:.2f}%")
 
